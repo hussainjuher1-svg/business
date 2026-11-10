@@ -1,0 +1,17 @@
+{
+  "name": "daybook",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Daybook — simple, intelligent business-management platform for small service businesses",
+  "scripts": {
+    "install:all": "npm --prefix server install && npm --prefix client install",
+    "db:migrate": "node server/src/migrate.js",
+    "db:seed": "node server/seed.js",
+    "dev": "concurrently \"npm --prefix server run dev\" \"npm --prefix client run dev\"",
+    "start": "node server/src/index.js",
+    "build": "npm --prefix client run build"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0"
+  }
+}
