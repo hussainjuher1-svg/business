@@ -86,7 +86,7 @@ router.post('/auth/register', (req, res) => {
     name: z.string().min(1, 'Name is required'),
     businessName: z.string().min(1, 'Business name is required'),
   }).safeParse(req.body);
-  if (!parsed.success) return fail(res, 400, parsed.error.errors[0].message);
+  if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message);
   const { email, password, name, businessName } = parsed.data;
   const existing = get('SELECT id FROM users WHERE email = ?', [email.toLowerCase()]);
   if (existing) return fail(res, 409, 'An account with this email already exists. Try logging in.');
@@ -106,7 +106,7 @@ router.post('/auth/register', (req, res) => {
 
 router.post('/auth/login', loginGuard.loginRateLimit, (req, res) => {
   const parsed = z.object({ email: emailSchema, password: z.string().min(1) }).safeParse(req.body);
-  if (!parsed.success) return fail(res, 400, parsed.error.errors[0].message);
+  if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message);
   const email = parsed.data.email.toLowerCase();
   const user = get('SELECT * FROM users WHERE email = ?', [email]);
 
@@ -140,7 +140,7 @@ router.post('/auth/change-password', requireAuth, (req, res) => {
     currentPassword: z.string().min(1, 'Current password is required'),
     newPassword: z.string().min(1, 'New password is required'),
   }).safeParse(req.body);
-  if (!parsed.success) return fail(res, 400, parsed.error.errors[0].message);
+  if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message);
 
   const user = get('SELECT * FROM users WHERE id = ?', [req.user.id]);
   if (!user) return fail(res, 404, 'Account not found.');
@@ -269,7 +269,7 @@ router.post('/business/staff', requireAuth, resolveBusiness, requireRole('owner'
     name: z.string().min(1),
     role: z.enum(['owner', 'admin', 'staff']).default('staff'),
   }).safeParse(req.body);
-  if (!parsed.success) return fail(res, 400, parsed.error.errors[0].message);
+  if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message);
   let user = get('SELECT * FROM users WHERE email = ?', [parsed.data.email.toLowerCase()]);
   if (!user) {
     const info = run('INSERT INTO users (email, password_hash, name) VALUES (?,?,?)', [parsed.data.email.toLowerCase(), hashPassword(cryptoRandom()), parsed.data.name]);
@@ -288,7 +288,7 @@ function cryptoRandom() {
 
 router.patch('/business/staff/:userId', requireAuth, resolveBusiness, requireRole('owner', 'admin'), (req, res) => {
   const parsed = z.object({ role: z.enum(['owner', 'admin', 'staff']) }).safeParse(req.body);
-  if (!parsed.success) return fail(res, 400, parsed.error.errors[0].message);
+  if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message);
   run('UPDATE business_memberships SET role = ? WHERE business_id = ? AND user_id = ?', [parsed.data.role, req.businessId, req.params.userId]);
   res.json({ ok: true });
 });
@@ -315,7 +315,7 @@ router.post('/customers', requireAuth, resolveBusiness, (req, res) => {
     address: z.string().optional().default(''),
     notes: z.string().optional().default(''),
   }).safeParse(req.body);
-  if (!parsed.success) return fail(res, 400, parsed.error.errors[0].message);
+  if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message);
   const d = parsed.data;
   // duplicate warning: same phone or email already exists
   const dup = get(
@@ -347,7 +347,7 @@ router.patch('/customers/:id', requireAuth, resolveBusiness, (req, res) => {
     phone: z.string().optional(), email: z.string().optional(),
     address: z.string().optional(), notes: z.string().optional(),
   }).safeParse(req.body);
-  if (!parsed.success) return fail(res, 400, parsed.error.errors[0].message);
+  if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message);
   const sets = Object.keys(parsed.data).map((k) => `${k} = ?`);
   if (!sets.length) return fail(res, 400, 'No fields to update.');
   sets.push("updated_at = datetime('now')");
@@ -417,7 +417,7 @@ router.post('/inquiries', requireAuth, resolveBusiness, (req, res) => {
     assignedTo: z.number().int().nullable().optional(),
     followUpDate: z.string().nullable().optional(),
   }).safeParse(req.body);
-  if (!parsed.success) return fail(res, 400, parsed.error.errors[0].message);
+  if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message);
   const d = parsed.data;
   const info = run(`INSERT INTO inquiries (business_id, customer_id, contact_name, phone, email, source, subject, message, status, assigned_to, follow_up_date)
     VALUES (?,?,?,?,?,?,?,?, 'new', ?, ?)`,
@@ -444,7 +444,7 @@ router.patch('/inquiries/:id', requireAuth, resolveBusiness, (req, res) => {
     assignedTo: z.number().int().nullable().optional(),
     followUpDate: z.string().nullable().optional(),
   }).safeParse(req.body);
-  if (!parsed.success) return fail(res, 400, parsed.error.errors[0].message);
+  if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message);
   const map = { contactName: 'contact_name', customerId: 'customer_id', assignedTo: 'assigned_to', followUpDate: 'follow_up_date' };
   const sets = [];
   const params = [];
@@ -503,7 +503,7 @@ router.post('/estimates', requireAuth, resolveBusiness, (req, res) => {
     followUpDate: z.string().nullable().optional(),
     notes: z.string().optional().default(''),
   }).safeParse(req.body);
-  if (!parsed.success) return fail(res, 400, parsed.error.errors[0].message);
+  if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message);
   const d = parsed.data;
   const biz = get('SELECT currency FROM businesses WHERE id = ?', [req.businessId]);
   const info = run(`INSERT INTO estimates (business_id, customer_id, inquiry_id, title, description, amount, currency, status, issue_date, valid_until, follow_up_date, notes)
@@ -530,7 +530,7 @@ router.patch('/estimates/:id', requireAuth, resolveBusiness, (req, res) => {
     issueDate: z.string().nullable().optional(), validUntil: z.string().nullable().optional(),
     followUpDate: z.string().nullable().optional(), notes: z.string().optional(),
   }).safeParse(req.body);
-  if (!parsed.success) return fail(res, 400, parsed.error.errors[0].message);
+  if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message);
   const map = { customerId: 'customer_id', inquiryId: 'inquiry_id', issueDate: 'issue_date', validUntil: 'valid_until', followUpDate: 'follow_up_date' };
   const sets = [];
   const params = [];
@@ -570,7 +570,7 @@ router.post('/appointments', requireAuth, resolveBusiness, (req, res) => {
     instructions: z.string().optional().default(''),
     assignedTo: z.number().int().nullable().optional(),
   }).safeParse(req.body);
-  if (!parsed.success) return fail(res, 400, parsed.error.errors[0].message);
+  if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message);
   const d = parsed.data;
   const info = run(`INSERT INTO appointments (business_id, customer_id, job_id, title, starts_at, ends_at, location, instructions, status, assigned_to)
     VALUES (?,?,?,?,?,?,?,?, 'scheduled', ?)`,
@@ -588,7 +588,7 @@ router.patch('/appointments/:id', requireAuth, resolveBusiness, (req, res) => {
     location: z.string().optional(), instructions: z.string().optional(),
     assignedTo: z.number().int().nullable().optional(),
   }).safeParse(req.body);
-  if (!parsed.success) return fail(res, 400, parsed.error.errors[0].message);
+  if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message);
   const map = { startsAt: 'starts_at', endsAt: 'ends_at', customerId: 'customer_id', jobId: 'job_id', assignedTo: 'assigned_to' };
   const sets = [];
   const params = [];
@@ -627,7 +627,7 @@ router.post('/jobs', requireAuth, resolveBusiness, (req, res) => {
     scheduledDate: z.string().nullable().optional(),
     assignedTo: z.number().int().nullable().optional(),
   }).safeParse(req.body);
-  if (!parsed.success) return fail(res, 400, parsed.error.errors[0].message);
+  if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message);
   const d = parsed.data;
   const info = run(`INSERT INTO jobs (business_id, customer_id, inquiry_id, estimate_id, title, description, status, scheduled_date, assigned_to)
     VALUES (?,?,?,?,?,?, 'not_started', ?, ?)`,
@@ -645,7 +645,7 @@ router.patch('/jobs/:id', requireAuth, resolveBusiness, (req, res) => {
     estimateId: z.number().int().nullable().optional(),
     scheduledDate: z.string().nullable().optional(), assignedTo: z.number().int().nullable().optional(),
   }).safeParse(req.body);
-  if (!parsed.success) return fail(res, 400, parsed.error.errors[0].message);
+  if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message);
   const map = { customerId: 'customer_id', inquiryId: 'inquiry_id', estimateId: 'estimate_id', scheduledDate: 'scheduled_date', assignedTo: 'assigned_to' };
   const sets = [];
   const params = [];
@@ -682,7 +682,7 @@ router.post('/follow-ups', requireAuth, resolveBusiness, (req, res) => {
     jobId: z.number().int().nullable().optional(),
     assignedTo: z.number().int().nullable().optional(),
   }).safeParse(req.body);
-  if (!parsed.success) return fail(res, 400, parsed.error.errors[0].message);
+  if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message);
   const d = parsed.data;
   const info = run(`INSERT INTO follow_ups (business_id, customer_id, inquiry_id, estimate_id, job_id, title, notes, due_date, assigned_to, status)
     VALUES (?,?,?,?,?,?,?,?,?, 'open')`,
@@ -698,7 +698,7 @@ router.patch('/follow-ups/:id', requireAuth, resolveBusiness, (req, res) => {
     dueDate: z.string().optional(), status: z.enum(['open', 'completed', 'rescheduled']).optional(),
     assignedTo: z.number().int().nullable().optional(),
   }).safeParse(req.body);
-  if (!parsed.success) return fail(res, 400, parsed.error.errors[0].message);
+  if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message);
   const map = { dueDate: 'due_date', assignedTo: 'assigned_to' };
   const sets = [];
   const params = [];

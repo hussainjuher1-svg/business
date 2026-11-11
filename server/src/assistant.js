@@ -75,7 +75,7 @@ router.post('/chat', requireAuth, resolveBusiness, async (req, res, next) => {
     conversationId: z.number().int().optional(),
     useCache: z.boolean().optional(),
   }).safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: parsed.error.errors[0].message });
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message });
 
   const { message } = parsed.data;
   try {
@@ -190,7 +190,7 @@ router.patch('/settings', requireAuth, resolveBusiness, requireRole('owner', 'ad
     strictGrounding: z.boolean().optional(),
     cacheEnabled: z.boolean().optional(),
   }).safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: parsed.error.errors[0].message });
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message });
   const d = parsed.data;
 
   run(

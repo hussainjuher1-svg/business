@@ -157,7 +157,7 @@ router.get('/onboarding', requireAuth, resolveBusiness, (req, res) => {
 
 router.post('/onboarding/ack', requireAuth, resolveBusiness, requireRole('owner', 'admin'), (req, res) => {
   const parsed = z.object({ step: z.string().max(60) }).safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: parsed.error.errors[0].message });
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message });
   const state = get('SELECT * FROM onboarding_state WHERE business_id = ?', [req.businessId]);
   let steps = [];
   try {
@@ -176,7 +176,7 @@ router.post('/onboarding/ack', requireAuth, resolveBusiness, requireRole('owner'
 
 router.patch('/onboarding', requireAuth, resolveBusiness, requireRole('owner', 'admin'), (req, res) => {
   const parsed = z.object({ dismissed: z.boolean() }).safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: parsed.error.errors[0].message });
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message });
   run(
     `INSERT INTO onboarding_state (business_id, dismissed, updated_at) VALUES (?,?, datetime('now'))
      ON CONFLICT(business_id) DO UPDATE SET dismissed = excluded.dismissed, updated_at = datetime('now')`,
@@ -211,7 +211,7 @@ router.post('/onboarding/complete', requireAuth, resolveBusiness, requireRole('o
     faqs: z.array(z.object({ question: z.string().min(1).max(300), answer: z.string().min(1).max(4000) })).max(100).optional(),
     policiesExtra: z.array(z.object({ title: z.string().max(200), content: z.string().min(1).max(4000) })).max(50).optional(),
   }).safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: parsed.error.errors[0].message });
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message });
   const d = parsed.data;
 
   let updatedProfile = false;

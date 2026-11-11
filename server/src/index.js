@@ -36,7 +36,13 @@ if (process.env.TRUST_PROXY) {
 }
 
 app.use(cors({ origin: true, credentials: true }));
-app.use(express.json({ limit: '5mb' }));
+// 1 MB is comfortably more than any real request body this API accepts — the
+// largest are a knowledge entry (4,000 chars), a document-metadata payload and a
+// CSV import. It used to be 5 MB, which allowed a single request to carry ~436,000
+// array elements; every one of those that fails validation becomes an issue object
+// held in memory at once. Tightening the ceiling bounds the worst case for any
+// validator that accumulates issues, before the request ever reaches a route.
+app.use(express.json({ limit: '1mb' }));
 app.use(cookieParser());
 
 app.get('/health', (req, res) => res.json({ ok: true, service: 'daybook-api', db: DB_PATH }));
@@ -81,6 +87,21 @@ if (fs.existsSync(clientDist)) {
 }
 
 app.use((err, req, res, next) => {
+  // A request body the client got wrong is not a server fault. Express body
+  // parsers report these with a status and a `type`; using them keeps real
+  // outages distinguishable from malformed input in the logs and to the client.
+  if (err && (err.type === 'entity.too.large' || err.status === 413)) {
+    return res.status(413).json({
+      error: 'That request was too large. The limit is 1 MB.',
+      code: 'PAYLOAD_TOO_LARGE',
+    });
+  }
+  if (err && err.type === 'entity.parse.failed') {
+    return res.status(400).json({
+      error: 'That request was not valid JSON.',
+      code: 'INVALID_JSON',
+    });
+  }
   console.error('[api] error:', err);
   res.status(500).json({ error: 'Something went wrong on the server. Please try again.' });
 });

@@ -12,6 +12,7 @@ const { q, get, run, logActivity } = require('./db');
 const { requireAuth, resolveBusiness, requireRole } = require('./auth');
 const retrieval = require('./ai/retrieval');
 const { extract } = require('./ai/extract');
+const { uploadErrorHandler, asyncRoute } = require('./upload-errors');
 const { screen } = require('./ai/guard');
 const assistantEngine = require('./ai/assistant');
 
@@ -40,15 +41,47 @@ const CATEGORY_META = [
   { id: 'other', label: 'Other', hint: 'Anything else worth knowing.', area: 'other' },
 ];
 
+/**
+ * Document upload limits.
+ *
+ * Every limit here is a defence against a malformed or hostile multipart body,
+ * not a product decision. Multer 2.x fixed a series of denial-of-service bugs
+ * that were all triggered by *shapes* of multipart input (deeply nested field
+ * names, huge numeric array indexes, oversized field values), so each of those
+ * shapes is bounded explicitly rather than relying on the library's defaults.
+ *
+ * Sizes: 10 MB is comfortably above the largest document an owner would upload
+ * (a scanned PDF) and small enough that a memory-stored buffer cannot exhaust
+ * the process.
+ *
+ * `fieldNestingDepth: 1` and `fieldArrayIndexLimit: 100` are the important ones.
+ * The upload form sends only flat fields (`docType`), so nested bracket notation
+ * such as `a[b][c]` has no legitimate use here at all; depth 1 permits flat names
+ * and nothing deeper.
+ */
+const UPLOAD_MAX_BYTES = 10 * 1024 * 1024;
+
 const upload = multer({
+  // Memory storage is deliberate: the buffer is extracted and discarded, so an
+  // interrupted upload cannot leave a partial file on disk. There is also no
+  // disk write to orphan, which removes one whole class of the 2.x advisories.
   storage: multer.memoryStorage(),
-  limits: { fileSize: 10 * 1024 * 1024, files: 1 },
+  limits: {
+    fileSize: UPLOAD_MAX_BYTES, // bytes per file
+    files: 1,                   // this endpoint accepts exactly one document
+    parts: 8,                   // total multipart parts (1 file + a few fields)
+    fields: 8,                  // non-file fields
+    fieldSize: 64 * 1024,       // bytes per field value; docType is tiny
+    fieldNameSize: 200,         // bytes per field NAME
+    fieldNestingDepth: 1,       // flat names only; blocks `a[b][c]...`
+    fieldArrayIndexLimit: 100,  // blocks sparse-array index exhaustion
+  },
 });
 
 const itemSchema = z.object({
   category: z.enum(CATEGORIES),
   title: z.string().max(240).optional().default(''),
-  content: z.string().min(1, 'Content is required'),
+  content: z.string({ error: 'Content is required' }).min(1, 'Content is required'),
   source: z.enum(['manual', 'onboarding', 'csv_import', 'document', 'seed']).optional().default('manual'),
   sourceDetail: z.string().max(500).optional().default(''),
   effectiveDate: z.string().max(40).nullable().optional(),
@@ -153,7 +186,7 @@ router.get('/status', requireAuth, resolveBusiness, async (req, res) => {
 
 router.post('/', requireAuth, resolveBusiness, requireRole('owner', 'admin'), async (req, res) => {
   const parsed = itemSchema.safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: parsed.error.errors[0].message });
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message });
   const d = parsed.data;
 
   if (d.supersedesId) {
@@ -194,7 +227,7 @@ router.patch('/:id', requireAuth, resolveBusiness, requireRole('owner', 'admin')
   if (!existing) return res.status(404).json({ error: 'Knowledge item not found.' });
 
   const parsed = itemSchema.partial().safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: parsed.error.errors[0].message });
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message });
   const d = parsed.data;
 
   if (d.supersedesId) {
@@ -242,8 +275,16 @@ router.delete('/:id', requireAuth, resolveBusiness, requireRole('owner', 'admin'
 // Documents
 // ---------------------------------------------------------------------------
 
-router.post('/documents', requireAuth, resolveBusiness, requireRole('owner', 'admin'), upload.single('file'), async (req, res) => {
+// The upload middleware's errors are translated here, next to the route that
+// produces them. Passing them to the app-wide handler would turn a bad request
+// body into a 500 and bury real faults.
+const acceptDocument = (req, res, next) => {
+  upload.single('file')(req, res, (err) => (err ? uploadErrorHandler(err, req, res, next) : next()));
+};
+
+router.post('/documents', requireAuth, resolveBusiness, requireRole('owner', 'admin'), acceptDocument, asyncRoute(async (req, res) => {
   if (!req.file) return res.status(400).json({ error: 'No file uploaded.' });
+  // `docType` is attacker-controlled text; cap it before it reaches the database.
   const docType = String(req.body?.docType || 'other').slice(0, 60);
 
   const result = extract({ buffer: req.file.buffer, filename: req.file.originalname, mime: req.file.mimetype });
@@ -286,7 +327,7 @@ router.post('/documents', requireAuth, resolveBusiness, requireRole('owner', 'ad
     indexed,
     injectionWarning: check.flagged ? check.reasons : [],
   });
-});
+}));
 
 router.get('/documents/:id', requireAuth, resolveBusiness, (req, res) => {
   const doc = get('SELECT * FROM business_documents WHERE id = ? AND business_id = ?', [req.params.id, req.businessId]);
@@ -357,10 +398,10 @@ function parseCsv(text) {
 router.post('/import', requireAuth, resolveBusiness, requireRole('owner', 'admin'), (req, res) => {
   const parsed = z.object({
     kind: z.enum(['knowledge', 'customers']),
-    csv: z.string().min(1, 'CSV content is required'),
+    csv: z.string({ error: 'CSV content is required' }).min(1, 'CSV content is required'),
     dryRun: z.boolean().optional().default(false),
   }).safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: parsed.error.errors[0].message });
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message });
 
   const rows = parseCsv(parsed.data.csv);
   if (rows.length < 2) return res.status(400).json({ error: 'CSV needs a header row and at least one data row.' });
@@ -512,14 +553,14 @@ router.get('/services', requireAuth, resolveBusiness, (req, res) => {
  */
 async function createService(req, res) {
   const parsed = z.object({
-    name: z.string().min(1, 'Service name is required'),
+    name: z.string({ error: 'Service name is required' }).min(1, 'Service name is required'),
     description: z.string().optional().default(''),
     priceMin: z.number().nullable().optional(),
     priceMax: z.number().nullable().optional(),
     priceNote: z.string().optional().default(''),
     durationMinutes: z.number().int().nullable().optional(),
   }).safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: parsed.error.errors[0].message });
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message });
   const d = parsed.data;
 
   const info = run(
@@ -543,7 +584,7 @@ async function updateService(req, res) {
     priceNote: z.string().optional(),
     durationMinutes: z.number().int().nullable().optional(),
   }).safeParse(req.body);
-  if (!parsed.success) return res.status(400).json({ error: parsed.error.errors[0].message });
+  if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message });
   const map = { priceMin: 'price_min', priceMax: 'price_max', priceNote: 'price_note', durationMinutes: 'duration_minutes' };
   const sets = [];
   const params = [];
