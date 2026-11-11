@@ -2,14 +2,15 @@
   "name": "daybook",
   "version": "1.0.0",
   "private": true,
-  "description": "Daybook — simple, intelligent business-management platform for small service businesses",
+  "description": "Daybook \u2014 simple, intelligent business-management platform with a local-only AI assistant",
   "scripts": {
     "install:all": "npm --prefix server install && npm --prefix client install",
     "db:migrate": "node server/src/migrate.js",
     "db:seed": "node server/seed.js",
     "dev": "concurrently \"npm --prefix server run dev\" \"npm --prefix client run dev\"",
     "start": "node server/src/index.js",
-    "build": "npm --prefix client run build"
+    "build": "npm --prefix client run build",
+    "test": "NODE_NO_WARNINGS=1 node --test server/test/assistant.test.js"
   },
   "devDependencies": {
     "concurrently": "^9.1.0"

@@ -6,16 +6,18 @@ import Inquiries from './pages/Inquiries';
 import Customers from './pages/Customers';
 import Work from './pages/Work';
 import Settings from './pages/Settings';
+import Knowledge from './pages/Knowledge';
 import Assistant from './components/Assistant';
 import { Loading, ErrorBox } from './components/ui';
 
-type Page = 'today' | 'inquiries' | 'customers' | 'work' | 'settings';
+type Page = 'today' | 'inquiries' | 'customers' | 'work' | 'knowledge' | 'settings';
 
 const NAV: { id: Page; label: string; icon: string }[] = [
   { id: 'today', label: 'Today', icon: '◉' },
   { id: 'inquiries', label: 'Inquiries', icon: '✉' },
   { id: 'customers', label: 'Customers', icon: '◎' },
   { id: 'work', label: 'Work', icon: '▣' },
+  { id: 'knowledge', label: 'Knowledge', icon: '❖' },
   { id: 'settings', label: 'Settings', icon: '⚙' },
 ];
 
@@ -72,6 +74,7 @@ export default function App() {
         {page === 'inquiries' && <Inquiries />}
         {page === 'customers' && <Customers />}
         {page === 'work' && <Work />}
+        {page === 'knowledge' && <Knowledge />}
         {page === 'settings' && <Settings />}
       </main>
 

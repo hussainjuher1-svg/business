@@ -23,6 +23,20 @@ export const api = {
   post: <T>(path: string, body?: any) => req<T>(path, { method: 'POST', body: JSON.stringify(body || {}) }),
   patch: <T>(path: string, body?: any) => req<T>(path, { method: 'PATCH', body: JSON.stringify(body || {}) }),
   del: <T>(path: string) => req<T>(path, { method: 'DELETE' }),
+  /** multipart upload (documents) — deliberately does not set Content-Type */
+  upload: async <T>(path: string, form: FormData): Promise<T> => {
+    const res = await fetch(`/api${path}`, { method: 'POST', credentials: 'include', body: form });
+    const text = await res.text();
+    let data: any = null;
+    try { data = text ? JSON.parse(text) : null; } catch { data = { error: text }; }
+    if (!res.ok) {
+      const err = new Error(data?.error || `Upload failed (${res.status})`) as Error & { status?: number; data?: any };
+      err.status = res.status;
+      err.data = data;
+      throw err;
+    }
+    return data as T;
+  },
 };
 
 export interface User { id: number; email: string; name: string }
