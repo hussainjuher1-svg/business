@@ -226,7 +226,25 @@ router.patch('/:id', requireAuth, resolveBusiness, requireRole('owner', 'admin')
   const existing = get('SELECT * FROM knowledge_items WHERE id = ? AND business_id = ?', [req.params.id, req.businessId]);
   if (!existing) return res.status(404).json({ error: 'Knowledge item not found.' });
 
-  const parsed = itemSchema.partial().safeParse(req.body);
+  // An update schema must contain ONLY what the caller actually sent.
+  //
+  // itemSchema has `.default(...)` on title, source, sourceDetail and status.
+  // `.partial()` makes the outer keys optional but does NOT remove an inner
+  // default, so parsing `{ status: 'archived' }` with `itemSchema.partial()`
+  // yields `{ status:'archived', title:'', source:'manual', sourceDetail:'' }`
+  // — and the handler below writes every key it receives. Archiving an entry
+  // therefore erased its title and source detail. The update schema is built
+  // from explicit optional fields with no defaults, so absent means absent.
+  const parsed = z.object({
+    category: z.enum(CATEGORIES).optional(),
+    title: z.string().max(240).optional(),
+    content: z.string().min(1, 'Content is required').optional(),
+    source: z.enum(['manual', 'onboarding', 'csv_import', 'document', 'seed']).optional(),
+    sourceDetail: z.string().max(500).optional(),
+    effectiveDate: z.string().max(40).nullable().optional(),
+    supersedesId: z.number().int().nullable().optional(),
+    status: z.enum(['active', 'archived']).optional(),
+  }).safeParse(req.body);
   if (!parsed.success) return res.status(400).json({ error: parsed.error.issues[0].message });
   const d = parsed.data;
 

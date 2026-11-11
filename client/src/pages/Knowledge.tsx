@@ -60,12 +60,15 @@ export default function Knowledge() {
   const [showImport, setShowImport] = useState(false);
   const [aiStatus, setAiStatus] = useState<any>(null);
   const [tab, setTab] = useState<'items' | 'documents' | 'services' | 'setup'>('items');
+  // Archived entries are held back by the API unless asked for explicitly, so
+  // without this the Restore button below could never be reached.
+  const [showArchived, setShowArchived] = useState(false);
 
   async function load() {
     setLoading(true);
     setError('');
     try {
-      const d = await api.get<any>('/knowledge');
+      const d = await api.get<any>(`/knowledge${showArchived ? '?includeArchived=1' : ''}`);
       setItems(d.items);
       setDocs(d.documents);
       setCategories(d.categories);
@@ -82,6 +85,10 @@ export default function Knowledge() {
     load();
     api.get<any>('/assistant/status').then(setAiStatus).catch(() => setAiStatus(null));
   }, []);
+
+  // Re-fetch when the archived toggle changes, so the list always reflects the
+  // switch rather than waiting for some unrelated reload.
+  useEffect(() => { load(); }, [showArchived]);
 
   const filtered = useMemo(() => {
     let rows = items;
@@ -200,6 +207,15 @@ export default function Knowledge() {
                 </option>
               ))}
             </select>
+            <label className="flex items-center gap-2 text-xs font-semibold text-stone-600">
+              <input
+                type="checkbox"
+                checked={showArchived}
+                onChange={(e) => setShowArchived(e.target.checked)}
+                className="h-4 w-4"
+              />
+              Show archived
+            </label>
             <span className="text-xs text-stone-500">{filtered.length} entr{filtered.length === 1 ? 'y' : 'ies'}</span>
           </div>
 

@@ -55,6 +55,25 @@ function fail(res, status, error, extra = {}) {
   return res.status(status).json({ error, ...extra });
 }
 
+/**
+ * An assignee must be someone who actually belongs to this business.
+ *
+ * `assigned_to` is a foreign key to users(id), so an id that does not exist used
+ * to surface as a 500 from the constraint rather than a clean 400 — and an id
+ * that exists but belongs to another business would have been accepted. Both are
+ * client errors, so they are answered as such.
+ *
+ * Returns an error message, or null when the value is acceptable.
+ */
+function invalidAssignee(businessId, assignedTo) {
+  if (assignedTo === undefined || assignedTo === null) return null; // "nobody"
+  const member = get(
+    'SELECT 1 AS ok FROM business_memberships WHERE business_id = ? AND user_id = ?',
+    [businessId, assignedTo]
+  );
+  return member ? null : 'assignedTo must be a member of this business.';
+}
+
 // ---------- helpers ----------
 function businessToday(timezone) {
   try {
@@ -445,6 +464,8 @@ router.patch('/inquiries/:id', requireAuth, resolveBusiness, (req, res) => {
     followUpDate: z.string().nullable().optional(),
   }).safeParse(req.body);
   if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message);
+  const badAssignee = invalidAssignee(req.businessId, parsed.data.assignedTo);
+  if (badAssignee) return fail(res, 400, badAssignee);
   const map = { contactName: 'contact_name', customerId: 'customer_id', assignedTo: 'assigned_to', followUpDate: 'follow_up_date' };
   const sets = [];
   const params = [];
@@ -582,13 +603,17 @@ router.post('/appointments', requireAuth, resolveBusiness, (req, res) => {
 
 router.patch('/appointments/:id', requireAuth, resolveBusiness, (req, res) => {
   const parsed = z.object({
-    title: z.string().min(1).optional(), startsAt: z.string().optional(), endsAt: z.string().nullable().optional(),
+    // A start time is required, so an empty string must be refused rather than
+    // written over a valid one and leaving the appointment with no slot.
+    title: z.string().min(1).optional(), startsAt: z.string().min(1, 'Start date/time cannot be empty').optional(), endsAt: z.string().nullable().optional(),
     status: z.enum(APPT_STATUSES).optional(),
     customerId: z.number().int().nullable().optional(), jobId: z.number().int().nullable().optional(),
     location: z.string().optional(), instructions: z.string().optional(),
     assignedTo: z.number().int().nullable().optional(),
   }).safeParse(req.body);
   if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message);
+  const badApptAssignee = invalidAssignee(req.businessId, parsed.data.assignedTo);
+  if (badApptAssignee) return fail(res, 400, badApptAssignee);
   const map = { startsAt: 'starts_at', endsAt: 'ends_at', customerId: 'customer_id', jobId: 'job_id', assignedTo: 'assigned_to' };
   const sets = [];
   const params = [];
@@ -646,6 +671,8 @@ router.patch('/jobs/:id', requireAuth, resolveBusiness, (req, res) => {
     scheduledDate: z.string().nullable().optional(), assignedTo: z.number().int().nullable().optional(),
   }).safeParse(req.body);
   if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message);
+  const badJobAssignee = invalidAssignee(req.businessId, parsed.data.assignedTo);
+  if (badJobAssignee) return fail(res, 400, badJobAssignee);
   const map = { customerId: 'customer_id', inquiryId: 'inquiry_id', estimateId: 'estimate_id', scheduledDate: 'scheduled_date', assignedTo: 'assigned_to' };
   const sets = [];
   const params = [];

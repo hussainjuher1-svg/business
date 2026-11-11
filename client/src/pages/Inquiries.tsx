@@ -14,6 +14,9 @@ export default function Inquiries() {
   const [showForm, setShowForm] = useState(false);
   const [detail, setDetail] = useState<any | null>(null);
   const [customers, setCustomers] = useState<any[]>([]);
+  // People this inquiry can be handed to. Loaded from /business, the same
+  // membership list Settings shows, so there is no second source of truth.
+  const [members, setMembers] = useState<any[]>([]);
 
   async function load() {
     setLoading(true);
@@ -26,6 +29,8 @@ export default function Inquiries() {
       setRows(res.data);
       const c = await api.get<{ data: any[] }>('/customers');
       setCustomers(c.data);
+      const b = await api.get<{ members: any[] }>('/business');
+      setMembers(b.members || []);
     } catch (e: any) {
       setError(e.message || 'Could not load inquiries.');
     } finally {
@@ -49,6 +54,15 @@ export default function Inquiries() {
       await api.patch(`/inquiries/${id}`, { status: s });
       load();
       if (detail) openDetail(id);
+    } catch (e: any) { setError(e.message); }
+  }
+
+  async function assign(id: number, assignedTo: string) {
+    try {
+      // An empty choice means "nobody owns this yet", which the API models as NULL.
+      await api.patch(`/inquiries/${id}`, { assignedTo: assignedTo ? Number(assignedTo) : null });
+      load();
+      openDetail(id);
     } catch (e: any) { setError(e.message); }
   }
 
@@ -112,6 +126,18 @@ export default function Inquiries() {
                 {STATUSES.map((s) => <option key={s} value={s}>{s.replace(/_/g, ' ')}</option>)}
               </select>
               {detail.inquiry.status !== 'converted' && <button className="btn-secondary" onClick={() => convert(detail.inquiry.id)}>Convert to customer</button>}
+            </div>
+            <div className="flex flex-wrap items-center gap-2">
+              <label className="text-xs font-bold uppercase tracking-wide text-stone-500" htmlFor="inquiry-assigned">Assigned to</label>
+              <select
+                id="inquiry-assigned"
+                value={detail.inquiry.assigned_to ? String(detail.inquiry.assigned_to) : ''}
+                onChange={(e) => assign(detail.inquiry.id, e.target.value)}
+                className="max-w-[220px]"
+              >
+                <option value="">Unassigned</option>
+                {members.map((m) => <option key={m.id} value={m.id}>{m.name}</option>)}
+              </select>
             </div>
             {detail.activity?.length > 0 && (
               <div>
