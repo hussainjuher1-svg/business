@@ -10,7 +10,11 @@
     "dev": "concurrently \"npm --prefix server run dev\" \"npm --prefix client run dev\"",
     "start": "node server/src/index.js",
     "build": "npm --prefix client run build",
-    "test": "NODE_NO_WARNINGS=1 node --test server/test/assistant.test.js"
+    "test": "NODE_NO_WARNINGS=1 node --test server/test/assistant.test.js",
+    "seed:hvac": "node server/seed-hvac.js",
+    "validate:hvac": "node server/validate-hvac.js",
+    "audit:pilot": "node server/audit-pilot.js",
+    "verify:persistence": "bash server/verify-persistence.sh"
   },
   "devDependencies": {
     "concurrently": "^9.1.0"

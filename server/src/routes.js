@@ -6,7 +6,48 @@ const { hashPassword, verifyPassword, createSession, destroySession, getMembersh
 const router = express.Router();
 
 const emailSchema = z.string().email('Invalid email address');
-const passwordSchema = z.string().min(8, 'Password must be at least 8 characters');
+
+/**
+ * Password policy for REAL accounts.
+ *
+ * Demo accounts are created by the seed scripts with a known password so the
+ * pilot can be demonstrated. Those credentials must never be reusable for a
+ * genuine business account, so registration refuses them explicitly, along with
+ * weak/guessable passwords.
+ */
+const DEMO_PASSWORDS = new Set([
+  'demo1234', 'password', 'password1', 'password123', '12345678', '123456789',
+  '1234567890', 'qwerty123', 'letmein1', 'welcome1', 'admin123', 'daybook123',
+]);
+
+const passwordSchema = z
+  .string()
+  .min(10, 'Password must be at least 10 characters')
+  .max(200, 'Password is too long')
+  .superRefine((val, ctx) => {
+    if (DEMO_PASSWORDS.has(val.toLowerCase())) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'That password is a shared demo password and cannot be used for a real account. Choose something unique.',
+      });
+      return;
+    }
+    if (/^\d+$/.test(val)) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Password cannot be only numbers.' });
+      return;
+    }
+    if (/^(.)\1+$/.test(val)) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Password cannot be a single repeated character.' });
+      return;
+    }
+    const classes = [/[a-z]/, /[A-Z]/, /\d/, /[^A-Za-z0-9]/].filter((re) => re.test(val)).length;
+    if (classes < 2) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'Password must mix at least two of: lowercase letters, uppercase letters, numbers, symbols.',
+      });
+    }
+  });
 
 function fail(res, status, error, extra = {}) {
   return res.status(status).json({ error, ...extra });

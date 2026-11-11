@@ -180,6 +180,71 @@ function computeGaps(businessId) {
 // Question understanding
 // ---------------------------------------------------------------------------
 
+/**
+ * Requests that must never be answered by dumping records:
+ * cross-business access attempts, system-prompt extraction, and questions in
+ * domains Daybook simply has no data for (finance, general knowledge).
+ */
+function classifyRefusal(text) {
+  if (/\b(other|another|all|every|different)\b[^.\n]{0,30}\bbusiness(es)?\b[^.\n]{0,40}\b(data|records?|customers?|information|knowledge)\b/i.test(text) ||
+      /\b(reveal|show|print|repeat|output|leak)\b[^.\n]{0,30}\b(system prompt|system message|your instructions|hidden prompt|initial instructions)\b/i.test(text) ||
+      /\bignore\b[^.\n]{0,40}\b(instructions?|rules?|prompt)\b/i.test(text)) {
+    return {
+      answer:
+        'I cannot do that. I can only answer questions about ' +
+        'this one business, using its own knowledge and records, and I will not share another ' +
+        "business's data or reveal my instructions. Ask me something about this business and I will help.",
+      mode: 'refused',
+      grounding: 'none',
+    };
+  }
+  // Domains Daybook holds no data for — do not dress up live records as an answer.
+  const offDomain =
+    /\b(profit|profits|profitability|revenue|turnover|margin|margins|tax(es)?|payroll|salary|salaries|vat|gst|balance ?sheet|cash ?flow|share price|stock price)\b/i.test(text)
+    || /\b(inventory|stock level|in stock|on hand|parts? (available|remaining))\b/i.test(text)
+    || /\b(capital of|population of|who (is|was) the (president|prime minister|king|queen)|weather (in|today|tomorrow)|recipe for|how tall is|translate)\b/i.test(text)
+    // general knowledge / trivia that is clearly not about this business
+    || /\b(who won|which team won|world cup|olympics?|oscars?|movie|film|celebrity|bitcoin|stock market|exchange rate|how old is|what year did)\b/i.test(text);
+  if (offDomain) {
+    const hasFinance = /\b(profit|revenue|turnover|margin|payroll|salary|salaries|tax|vat|gst|balance sheet|cash ?flow)\b/i.test(text);
+    const hasStock = /\b(inventory|stock|in stock|on hand|stock level|parts? (available|remaining))\b/i.test(text);
+    return {
+      answer: hasFinance
+        ? 'Daybook does not record financial results such as profit, revenue, margins or payroll, so I have no data to answer that and I will not estimate. ' +
+          'I can tell you about inquiries, estimates, appointments, jobs, follow-ups, customers and business knowledge. ' +
+          'Accounting figures live in your bookkeeping or accounting system.'
+        : hasStock
+          ? 'Daybook does not track inventory or parts stock, so I cannot tell you what is on hand. I will not guess a quantity. ' +
+            'If your price list mentions a part, that is pricing only — it says nothing about availability.'
+          : 'That is outside what Daybook holds. I only answer from this business\'s knowledge base and its Daybook records, ' +
+            'so I cannot answer general-knowledge or third-party questions. Ask me about services, pricing, policies, customers, inquiries, ' +
+            'estimates, appointments, jobs or follow-ups.',
+      mode: 'out-of-scope',
+      grounding: 'none',
+    };
+  }
+  return null;
+}
+
+/** Capability questions (needed for an honest "no data" message). */
+const CAPABILITY_TOPICS = [
+  { re: /\b(profit|revenue|margin|payroll|salary|tax|vat|gst|balance sheet|cash ?flow|financial|financ)/i, area: 'financial results', tracked: false },
+  { re: /\b(inventory|stock level|parts on hand)/i, area: 'inventory', tracked: false },
+  { re: /\b(employee timesheet|hours worked|payroll hours)/i, area: 'timesheets', tracked: false },
+  { re: /\b(invoice|billing|paid|unpaid|payment status)/i, area: 'invoice and payment tracking', tracked: false },
+  { re: /\b(contract|signed agreement|paperwork)/i, area: 'signed contracts', tracked: false },
+];
+
+function missingKnowledgeMessage(question) {
+  const topic = CAPABILITY_TOPICS.find((t) => t.re.test(question));
+  if (topic && !topic.tracked) {
+    return `Daybook does not currently track ${topic.area}, so I have no records to draw on and I will not guess. ` +
+      'I can answer questions about services, pricing, policies, customers, inquiries, estimates, appointments, jobs and follow-ups.';
+  }
+  return `I could not find any business knowledge or records that answer "${String(question).slice(0, 120)}". ` +
+    'Rather than guess, I am telling you the information is missing.';
+}
+
 function isHelpQuestion(text) {
   return /\b(how do i|how can i|how to|where do i|explain how|how does daybook|help me use|walk me through)\b/i.test(text);
 }
@@ -460,6 +525,12 @@ async function answer({ businessId, userId, question, history = [], useCache = t
     cached: false,
   };
 
+  // ---- requests we must never answer by dumping records ----
+  const refusal = classifyRefusal(question);
+  if (refusal) {
+    return { ...base, ...refusal, sources: [], latencyMs: Date.now() - started };
+  }
+
   // ---- help questions are answered deterministically (they are about Daybook) ----
   if (isHelpQuestion(question)) {
     return { ...base, answer: helpAnswer(question), mode: 'builtin-guide', grounding: 'verified', latencyMs: Date.now() - started };
@@ -473,7 +544,9 @@ async function answer({ businessId, userId, question, history = [], useCache = t
     return {
       ...base,
       gaps: scoped.map((g) => ({ label: g.label, area: g.area, hint: g.hint })),
-      answer: evidenceOnlyAnswer({ knowledgeHits: [], operational: null, conflicts, gaps: scoped, question }),
+      answer: `${missingKnowledgeMessage(question)}${
+        scoped.length ? `\n\nMissing information includes: ${scoped.slice(0, 4).map((g) => g.label).join(', ')}.` : ''
+      }`,
       mode: 'no-evidence',
       grounding: 'none',
       latencyMs: Date.now() - started,
@@ -494,9 +567,18 @@ async function answer({ businessId, userId, question, history = [], useCache = t
   }
 
   if (!status.available || !status.chatModelReady) {
+    // If the owner asked a knowledge question (price, policy, area…) and we have no
+    // knowledge chunk for it, say so explicitly. Showing only live records would
+    // let a "how much do we charge for X?" question look answered when it is not.
+    const knowledgeAsked = knowledgeIntents.length > 0;
+    const noKnowledgeHit = usableHits.length === 0;
+    const missingNote =
+      knowledgeAsked && noKnowledgeHit
+        ? `I have no knowledge entry covering this, so I cannot state a figure or policy — I will not guess.\n\n`
+        : '';
     return {
       ...base,
-      answer: `${status.problem || 'The local AI model is unavailable.'}\n\nHere is the evidence I found instead:\n\n${evidenceOnlyAnswer({ knowledgeHits: usableHits, operational, conflicts, gaps: relevantGaps(allGaps, knowledgeIntents, opIntents), question })}`,
+      answer: `${status.problem || 'The local AI model is unavailable.'}\n\n${missingNote}Here is the evidence I found instead:\n\n${evidenceOnlyAnswer({ knowledgeHits: usableHits, operational, conflicts, gaps: relevantGaps(allGaps, knowledgeIntents, opIntents), question })}`,
       mode: 'model-offline',
       grounding: 'evidence',
       warnings: [...warnings, status.problem || 'Local model unavailable.'],

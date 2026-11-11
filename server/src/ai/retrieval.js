@@ -221,17 +221,31 @@ async function reindexServiceCatalog(businessId, opts = {}) {
       s.duration_minutes ? `Typical duration: ${s.duration_minutes} minutes` : '',
     ].filter(Boolean).join('\n');
   });
-  const text = lines.join('\n\n');
-  return indexSource({
-    businessId,
-    sourceType: 'catalog',
-    sourceId: businessId,
-    title: 'Services and pricing',
-    text,
-    category: 'service',
-    embedModel: opts.embedModel,
-    skipEmbeddings: opts.skipEmbeddings,
-  });
+  // Clear previous catalog chunks, then index ONE CHUNK PER SERVICE so a question
+  // about a single service can retrieve its own price instead of a truncated blob.
+  const oldChunks = q(`SELECT id FROM knowledge_chunks WHERE business_id = ? AND source_type = 'catalog'`, [businessId]);
+  for (const c of oldChunks) run('DELETE FROM knowledge_chunks_fts WHERE rowid = ?', [c.id]);
+  run(`DELETE FROM knowledge_chunks WHERE business_id = ? AND source_type = 'catalog'`, [businessId]);
+
+  let chunks = 0;
+  let embedded = 0;
+  let embedError = null;
+  for (let i = 0; i < services.length; i++) {
+    const r = await indexSource({
+      businessId,
+      sourceType: 'catalog',
+      sourceId: services[i].id,
+      title: services[i].name,
+      text: lines[i],
+      category: 'service',
+      embedModel: opts.embedModel,
+      skipEmbeddings: opts.skipEmbeddings,
+    });
+    chunks += r.chunks;
+    embedded += r.embedded;
+    embedError = embedError || r.embedError;
+  }
+  return { chunks, embedded, embedError };
 }
 
 // ---------------------------------------------------------------------------
@@ -252,6 +266,10 @@ const STOPWORDS = new Set([
   // domain noise: these appear in almost every knowledge entry, so they carry no signal
   'business', 'businesses', 'company', 'currently', 'right', 'now', 'say', 'says', 'said',
   'know', 'knows', 'thing', 'things', 'way', 'ways', 'able', 'actually', 'really',
+  // entity nouns: every business document mentions customers/staff/jobs, so matching
+  // only these is not evidence. Kept for FTS recall, excluded from content coverage.
+  'customer', 'customers', 'client', 'clients', 'staff', 'team', 'member', 'members',
+  'job', 'jobs', 'worker', 'workers', 'employee', 'employees', 'record', 'records',
 ]);
 
 /** Crude suffix stripping so "policies" matches "policy" and "delaying" matches "delay". */
@@ -356,15 +374,24 @@ async function searchKnowledge({ businessId, query: queryText, limit = 8, embedM
 
   const queryTerms = [...new Set(tokenize(queryText))];
   const queryStems = queryTerms.map(stem);
+  // Coverage is judged on terms that actually carry meaning. If the question is
+  // ONLY entity nouns ("how many customers"), contentTerms is empty and coverage
+  // is meaningless — such questions must be answered from records, not documents.
+  const CONTENT_STOP = new Set([
+    'customer', 'customers', 'client', 'clients', 'staff', 'team', 'member', 'members',
+    'job', 'jobs', 'how many', 'how much', 'many', 'much',
+  ]);
+  const contentTerms = queryTerms.filter((t) => !CONTENT_STOP.has(t));
+  const contentStems = contentTerms.map(stem);
 
   const hits = [...scores.values()]
     .map((r) => {
       const bodyWords = wordSet(r.text);
       const titleWords = wordSet(r.title);
-      const covered = queryTerms.filter((_t, i) => bodyWords.has(queryStems[i]) || titleWords.has(queryStems[i]));
-      const titleCovered = queryTerms.filter((_t, i) => titleWords.has(queryStems[i]));
-      const coverage = queryTerms.length ? covered.length / queryTerms.length : 0;
-      const titleCoverage = queryTerms.length ? titleCovered.length / queryTerms.length : 0;
+      const covered = contentTerms.filter((_t, i) => bodyWords.has(contentStems[i]) || titleWords.has(contentStems[i]));
+      const titleCovered = contentTerms.filter((_t, i) => titleWords.has(contentStems[i]));
+      const coverage = contentStems.length ? covered.length / contentStems.length : 0;
+      const titleCoverage = contentStems.length ? titleCovered.length / contentStems.length : 0;
       const affinity = intentCategories && intentCategories.includes(r.category) ? 1 : 0;
       const lexical = r.lexical || 0;
       const vector = r.vector || 0;
@@ -445,14 +472,16 @@ function describeSource(businessId, hit) {
     };
   }
   if (hit.sourceType === 'catalog') {
+    const svc = get('SELECT * FROM business_services WHERE id = ? AND business_id = ?', [hit.sourceId, businessId]);
+    if (!svc) return null;
     return {
       kind: 'service_catalog',
-      id: null,
-      title: 'Services and pricing',
+      id: svc.id,
+      title: svc.name,
       category: 'service',
       source: 'catalog',
       sourceDetail: 'Business services list',
-      lastUpdated: get('SELECT MAX(last_updated) AS d FROM business_services WHERE business_id = ?', [businessId])?.d || null,
+      lastUpdated: svc.last_updated,
       status: 'active',
       snippet: sanitizeForPrompt(hit.text, 400),
       flagged: hit.injectionFlag,

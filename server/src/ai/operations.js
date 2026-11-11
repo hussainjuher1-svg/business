@@ -33,7 +33,7 @@ const INTENT_RULES = [
   { name: 'appointments', re: /\b(appointments?|bookings?|booked|schedul\w*|calendar|visits?)\b/i },
   { name: 'jobs', re: /\b(jobs?|work in progress|delay\w*|blocked|stuck|on site|install\w*|projects?)\b/i },
   { name: 'followups', re: /\b(follow[- ]?ups?|chase|check back|reminders?|due today)\b/i },
-  { name: 'customers', re: /\b(customers?|clients?|who is|contact details)\b/i },
+  { name: 'customers', re: /\b(customers?|clients?|how many customers|who is|contact details)\b/i },
   { name: 'summary', re: /\b(summar\w*|overview|this week|weekly|activity|how are we|performance|recap|reports?)\b/i },
   { name: 'staff', re: /\b(staff|team|who is working|assign\w*|responsib\w*|employees?|technicians?)\b/i },
   { name: 'comms', re: /\b(communications?|updates?|contacted|last spoke|conversations?|history|messages?)\b/i },
