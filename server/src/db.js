@@ -2,10 +2,15 @@ const { DatabaseSync } = require('node:sqlite');
 const fs = require('node:fs');
 const path = require('node:path');
 
+// Resolve a relative DB_PATH against the repository root, not the current
+// working directory. Otherwise the same .env would silently point at different
+// files depending on where npm was started from (a Windows failure mode).
 const DATA_DIR = process.env.DB_PATH
-  ? path.dirname(process.env.DB_PATH)
+  ? path.dirname(path.resolve(__dirname, '..', '..', process.env.DB_PATH))
   : path.join(__dirname, '..', '..', 'data');
-const DB_PATH = process.env.DB_PATH || path.join(DATA_DIR, 'daybook.db');
+const DB_PATH = process.env.DB_PATH
+  ? path.resolve(__dirname, '..', '..', process.env.DB_PATH)
+  : path.join(DATA_DIR, 'daybook.db');
 
 fs.mkdirSync(path.dirname(DB_PATH), { recursive: true });
 

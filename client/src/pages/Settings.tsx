@@ -42,7 +42,10 @@ export default function Settings() {
   async function addService(e: React.FormEvent) {
     e.preventDefault();
     try {
-      await api.post('/business/services', newService);
+      // Canonical service path. The older /business/services route cannot store
+      // pricing, so using it here would create services the Services & pricing
+      // tab shows as unpriced.
+      await api.post('/knowledge/services', newService);
       setNewService({ name: '', description: '' });
       load();
     } catch (err: any) { setError(err.message); }
@@ -79,7 +82,10 @@ export default function Settings() {
     <div className="space-y-6">
       <div>
         <h1 className="text-2xl font-extrabold tracking-tight text-ink">Settings</h1>
-        <p className="text-sm text-stone-500">Business information, services, staff and permissions. The assistant uses this as its business knowledge.</p>
+        <p className="text-sm text-stone-500">
+          Business information, staff and permissions. Detailed business knowledge (FAQs, policies, pricing rules, documents) lives in the
+          <strong> Knowledge</strong> section — that is what the assistant cites.
+        </p>
       </div>
       {error && <ErrorBox message={error} />}
       {saved && <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-800">{saved}</div>}
@@ -96,6 +102,11 @@ export default function Settings() {
         <Field label="Service areas"><textarea rows={2} value={form.service_areas || ''} onChange={(e) => setForm({ ...form, service_areas: e.target.value })} /></Field>
         <Field label="Business policies"><textarea rows={3} value={form.policies || ''} onChange={(e) => setForm({ ...form, policies: e.target.value })} placeholder="Cancellation policy, terms, etc." /></Field>
         <Field label="Payment methods"><input value={form.payment_methods || ''} onChange={(e) => setForm({ ...form, payment_methods: e.target.value })} placeholder="e.g. Cash, card, bank transfer" /></Field>
+        <p className="rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-[11px] text-stone-600">
+          <strong>What Daybook tracks:</strong> your payment terms (as knowledge), services and prices, and estimate
+          status. <strong>What it does not track:</strong> invoices, payments received, outstanding balances or who has paid.
+          Keep those in your accounting system — the assistant will tell you the same thing rather than guess.
+        </p>
         <div className="grid grid-cols-2 gap-3">
           <Field label="Currency"><input value={form.currency || ''} onChange={(e) => setForm({ ...form, currency: e.target.value })} /></Field>
           <Field label="Timezone"><input value={form.timezone || ''} onChange={(e) => setForm({ ...form, timezone: e.target.value })} placeholder="e.g. UTC, Asia/Dhaka" /></Field>
@@ -110,7 +121,7 @@ export default function Settings() {
           {data.services?.map((s: any) => (
             <li key={s.id} className="flex items-center justify-between rounded-lg bg-stone-50 px-3 py-2">
               <div><p className="text-sm font-semibold text-ink">{s.name}</p>{s.description && <p className="text-xs text-stone-500">{s.description}</p>}</div>
-              <button className="btn-danger" onClick={async () => { await api.del(`/business/services/${s.id}`); load(); }}>Remove</button>
+              <button className="btn-danger" onClick={async () => { await api.del(`/knowledge/services/${s.id}`); load(); }}>Remove</button>
             </li>
           ))}
         </ul>
@@ -120,6 +131,8 @@ export default function Settings() {
           <button className="btn-secondary" type="submit">Add service</button>
         </form>
       </section>
+
+      <AiSettings />
 
       <section className="card space-y-3 p-5">
         <h2 className="text-base font-bold text-ink">Staff &amp; permissions</h2>
@@ -147,5 +160,142 @@ export default function Settings() {
         </form>
       </section>
     </div>
+  );
+}
+
+
+function AiSettings() {
+  const [status, setStatus] = useState<any>(null);
+  const [form, setForm] = useState<any>({ chatModel: '', embedModel: '', enabled: true, strictGrounding: true, cacheEnabled: true });
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState('');
+
+  async function load() {
+    try {
+      const d = await api.get<any>('/assistant/status');
+      setStatus(d);
+      setForm({
+        chatModel: d.settings?.chatModel || '',
+        embedModel: d.settings?.embedModel || '',
+        enabled: d.settings?.enabled ?? true,
+        strictGrounding: d.settings?.strictGrounding ?? true,
+        cacheEnabled: d.settings?.cacheEnabled ?? true,
+      });
+    } catch {
+      setStatus(null);
+    }
+  }
+  useEffect(() => { load(); }, []);
+
+  async function save(patch: any) {
+    setBusy(true);
+    setMsg('');
+    try {
+      await api.patch('/assistant/settings', patch);
+      setMsg('AI settings saved.');
+      await load();
+    } catch (e: any) {
+      setMsg(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function reindex(clearCache: boolean) {
+    setBusy(true);
+    setMsg('');
+    try {
+      if (clearCache) {
+        await api.post('/assistant/cache/clear', {});
+        setMsg('Cached answers cleared.');
+      } else {
+        const r = await api.post<any>('/knowledge/reindex-all', {});
+        setMsg(`Re-indexed ${r.chunks} chunk(s), embedded ${r.embedded}.${r.embedError ? ` Embedding note: ${r.embedError}` : ''}`);
+      }
+      await load();
+    } catch (e: any) {
+      setMsg(e.message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  if (!status) return null;
+
+  const installed: string[] = status.model?.installedModels || [];
+
+  return (
+    <section className="card space-y-3 p-5">
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <div>
+          <h2 className="text-base font-bold text-ink">Local AI (Ollama)</h2>
+          <p className="text-xs text-stone-500">
+            Daybook only talks to a model running on your own machine. There is no paid API, no key, and no silent fallback.
+          </p>
+        </div>
+        <span className={`badge ${status.model?.available ? 'bg-emerald-100 text-emerald-900' : 'bg-amber-100 text-amber-900'}`}>
+          {status.model?.available ? 'Ollama reachable' : 'Ollama offline'}
+        </span>
+      </div>
+
+      <div className="rounded-lg bg-stone-50 px-3 py-2 text-xs text-stone-600">
+        <p>Endpoint: <span className="font-mono">{status.model?.baseUrl}</span></p>
+        <p>Indexed locally: {status.knowledge?.chunks || 0} chunk(s), {status.knowledge?.embeddings || 0} embedding(s), {status.knowledge?.items || 0} knowledge entr{(status.knowledge?.items || 0) === 1 ? 'y' : 'ies'}.</p>
+        {status.model?.problem && <p className="mt-1 text-amber-800">{status.model.problem}</p>}
+        {installed.length > 0 && <p className="mt-1">Installed models: {installed.join(', ')}</p>}
+      </div>
+      {installed.length === 0 && status.model?.available && (
+        <p className="text-xs text-amber-800">Ollama is reachable but has no models installed. Run: <span className="font-mono">ollama pull llama3.2:3b</span></p>
+      )}
+
+      {msg && <p className="text-xs font-semibold text-teal-800">{msg}</p>}
+
+      <div className="grid gap-3 sm:grid-cols-2">
+        <Field label="Chat model">
+          <input
+            value={form.chatModel}
+            onChange={(e) => setForm({ ...form, chatModel: e.target.value })}
+            placeholder={status.model?.chatModel || 'llama3.2:3b'}
+          />
+        </Field>
+        <Field label="Embedding model">
+          <input
+            value={form.embedModel}
+            onChange={(e) => setForm({ ...form, embedModel: e.target.value })}
+            placeholder={status.model?.embedModel || 'nomic-embed-text'}
+          />
+        </Field>
+      </div>
+
+      <div className="space-y-1.5">
+        {[
+          ['enabled', 'Use the local model for answers', 'When off, you still get retrieved evidence but no generated wording.'],
+          ['strictGrounding', 'Strict grounding', 'Prefer "I do not have that information" over any guess.'],
+          ['cacheEnabled', 'Cache repeated knowledge-only answers', 'Operational and personal questions are never cached.'],
+        ].map(([key, label, hint]) => (
+          <label key={key} className="flex items-start gap-2 text-sm font-normal normal-case tracking-normal text-ink">
+            <input
+              type="checkbox"
+              className="mt-0.5 !w-auto"
+              checked={!!form[key]}
+              onChange={(e) => { setForm({ ...form, [key]: e.target.checked }); save({ [key]: e.target.checked }); }}
+            />
+            <span>
+              <span className="font-semibold">{label}</span>
+              <span className="block text-xs text-stone-500">{hint}</span>
+            </span>
+          </label>
+        ))}
+      </div>
+
+      <div className="flex flex-wrap justify-end gap-2">
+        <button className="btn-secondary" disabled={busy} onClick={() => reindex(true)}>Clear answer cache</button>
+        <button className="btn-secondary" disabled={busy} onClick={() => reindex(false)}>Re-index knowledge</button>
+        <button className="btn-primary" disabled={busy} onClick={() => save(form)}>Save AI settings</button>
+      </div>
+      <p className="text-[11px] text-stone-400">
+        Changing the embedding model requires re-indexing. Model names are passed to your local Ollama instance only.
+      </p>
+    </section>
   );
 }

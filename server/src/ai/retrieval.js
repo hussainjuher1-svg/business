@@ -1,0 +1,640 @@
+/**
+ * Local retrieval system.
+ *
+ * Design rules enforced here:
+ *  - every query is filtered by business_id in SQL, never after ranking;
+ *  - retrieval is hybrid: FTS5 BM25 + optional local embeddings (cosine);
+ *  - the whole database is never sent to the model, only top-k chunks;
+ *  - untrusted text is screened for prompt injection at ingest and at read time;
+ *  - superseded knowledge is never cited as current fact, but is never deleted:
+ *    the row and its provenance stay for historical audit and are surfaced as a
+ *    conflict instead.
+ */
+
+const { q, get, run } = require('../db');
+const ollama = require('./ollama');
+const { screen, sanitizeForPrompt } = require('./guard');
+
+const CHUNK_TARGET = 900;
+const CHUNK_OVERLAP = 120;
+const MAX_CHUNKS_PER_SOURCE = 40;
+
+function vecToBlob(vec) {
+  return new Uint8Array(Float32Array.from(vec).buffer);
+}
+function blobToVec(blob) {
+  const buf = Buffer.from(blob);
+  return new Float32Array(buf.buffer, buf.byteOffset, buf.byteLength / 4);
+}
+
+function cosine(a, b) {
+  const n = Math.min(a.length, b.length);
+  let dot = 0;
+  let na = 0;
+  let nb = 0;
+  for (let i = 0; i < n; i++) {
+    dot += a[i] * b[i];
+    na += a[i] * a[i];
+    nb += b[i] * b[i];
+  }
+  if (na === 0 || nb === 0) return 0;
+  return dot / (Math.sqrt(na) * Math.sqrt(nb));
+}
+
+/** Split long text into overlapping chunks at paragraph/sentence boundaries. */
+function chunkText(text) {
+  const clean = String(text || '').replace(/\r\n?/g, '\n').trim();
+  if (!clean) return [];
+  if (clean.length <= CHUNK_TARGET) return [clean];
+
+  const paragraphs = clean.split(/\n{2,}/);
+  const chunks = [];
+  let current = '';
+
+  const push = () => {
+    const t = current.trim();
+    if (t) chunks.push(t);
+    current = '';
+  };
+
+  for (const para of paragraphs) {
+    if (para.length > CHUNK_TARGET) {
+      push();
+      // Hard-split very long paragraphs on sentence boundaries.
+      const sentences = para.split(/(?<=[.!?])\s+/);
+      let buf = '';
+      for (const s of sentences) {
+        if ((buf + ' ' + s).trim().length > CHUNK_TARGET) {
+          const t = buf.trim();
+          if (t) chunks.push(t);
+          const tail = t.slice(-CHUNK_OVERLAP);
+          buf = `${tail} ${s}`;
+        } else {
+          buf = `${buf} ${s}`.trim();
+        }
+      }
+      const t = buf.trim();
+      if (t) chunks.push(t);
+      continue;
+    }
+    if ((current + '\n\n' + para).trim().length > CHUNK_TARGET) {
+      const tail = current.trim().slice(-CHUNK_OVERLAP);
+      push();
+      current = `${tail}\n\n${para}`;
+    } else {
+      current = current ? `${current}\n\n${para}` : para;
+    }
+  }
+  push();
+  return chunks.slice(0, MAX_CHUNKS_PER_SOURCE);
+}
+
+// ---------------------------------------------------------------------------
+// Index maintenance
+// ---------------------------------------------------------------------------
+
+function deleteChunksFor(sourceType, sourceId) {
+  const rows = q('SELECT id FROM knowledge_chunks WHERE source_type = ? AND source_id = ?', [sourceType, sourceId]);
+  for (const row of rows) {
+    run('DELETE FROM knowledge_chunks_fts WHERE rowid = ?', [row.id]);
+  }
+  run('DELETE FROM knowledge_chunks WHERE source_type = ? AND source_id = ?', [sourceType, sourceId]);
+}
+
+/**
+ * (Re)build chunks for a knowledge item, document, or the service catalog.
+ * Embeddings are generated only when the local embedding model is available;
+ * a missing embedding model degrades retrieval to full-text, never to silence.
+ */
+async function indexSource({ businessId, sourceType, sourceId, title, text, category, embedModel, skipEmbeddings = false }) {
+  deleteChunksFor(sourceType, sourceId);
+
+  const pieces = chunkText(text);
+  if (pieces.length === 0) return { chunks: 0, embedded: 0, embedError: null };
+
+  const inserted = [];
+  for (let i = 0; i < pieces.length; i++) {
+    const piece = pieces[i];
+    const check = screen(piece);
+    const info = run(
+      `INSERT INTO knowledge_chunks
+         (business_id, source_type, source_id, chunk_index, title, text, category, injection_flag, injection_reason, updated_at)
+       VALUES (?,?,?,?,?,?,?,?,?, datetime('now'))`,
+      [businessId, sourceType, sourceId, i, title || '', piece, category || 'other', check.flagged ? 1 : 0, check.reasons.join('; ')]
+    );
+    const id = Number(info.lastInsertRowid);
+    run('INSERT INTO knowledge_chunks_fts (rowid, title, text) VALUES (?,?,?)', [id, title || '', piece]);
+    inserted.push(id);
+  }
+
+  let embedded = 0;
+  let embedError = null;
+  if (!skipEmbeddings) {
+    try {
+      const { vectors, model, dim } = await ollama.embed(pieces, embedModel);
+      if (!model) {
+        // The embedding model did not identify itself. Storing the vectors under
+        // an unknown model would make them unmatchable at query time (a NULL
+        // never equals a NULL in SQL), so retrieval would silently fall back to
+        // full-text while reporting that embeddings were used. Refuse instead.
+        return { chunks: inserted.length, embedded: 0, embedError: 'embedding-model-unidentified' };
+      }
+      for (let i = 0; i < inserted.length; i++) {
+        run(
+          `INSERT INTO knowledge_embeddings (chunk_id, business_id, model, dim, vector, updated_at)
+           VALUES (?,?,?,?,?, datetime('now'))
+           ON CONFLICT(chunk_id) DO UPDATE SET model=excluded.model, dim=excluded.dim,
+             vector=excluded.vector, updated_at=datetime('now')`,
+          [inserted[i], businessId, model, dim, vecToBlob(vectors[i])]
+        );
+        embedded++;
+      }
+    } catch (err) {
+      embedError = err.code === 'EMBED_UNAVAILABLE' ? 'embedding-model-unavailable'
+      : err.code === 'EMBED_UNIDENTIFIED' ? 'embedding-model-unidentified'
+        : 'embedding-failed';
+    }
+  }
+
+  return { chunks: inserted.length, embedded, embedError };
+}
+
+function bumpKnowledgeVersion(businessId) {
+  run(
+    `INSERT INTO business_knowledge_version (business_id, version, updated_at) VALUES (?, 1, datetime('now'))
+     ON CONFLICT(business_id) DO UPDATE SET version = version + 1, updated_at = datetime('now')`,
+    [businessId]
+  );
+  run('DELETE FROM answer_cache WHERE business_id = ?', [businessId]);
+  return getKnowledgeVersion(businessId);
+}
+
+function getKnowledgeVersion(businessId) {
+  const row = get('SELECT version FROM business_knowledge_version WHERE business_id = ?', [businessId]);
+  return row?.version || 1;
+}
+
+/** Re-index a single knowledge item (called by the knowledge routes). */
+async function reindexItem(item, opts = {}) {
+  return indexSource({
+    businessId: item.business_id,
+    sourceType: 'item',
+    sourceId: item.id,
+    title: item.title,
+    text: item.content,
+    category: item.category,
+    embedModel: opts.embedModel,
+    skipEmbeddings: opts.skipEmbeddings,
+  });
+}
+
+async function reindexDocument(doc, opts = {}) {
+  if (!doc.extracted_text) {
+    deleteChunksFor('document', doc.id);
+    return { chunks: 0, embedded: 0, embedError: null };
+  }
+  return indexSource({
+    businessId: doc.business_id,
+    sourceType: 'document',
+    sourceId: doc.id,
+    title: doc.filename,
+    text: doc.extracted_text,
+    category: 'other',
+    embedModel: opts.embedModel,
+    skipEmbeddings: opts.skipEmbeddings,
+  });
+}
+
+/**
+ * The service catalog lives in business_services (real pricing data), so it is
+ * indexed as a retrieval source rather than duplicated into a separate store.
+ */
+async function reindexServiceCatalog(businessId, opts = {}) {
+  const services = q('SELECT * FROM business_services WHERE business_id = ? ORDER BY name', [businessId]);
+  const lines = services.map((s) => {
+    const min = s.price_min;
+    const max = s.price_max;
+    let price;
+    if (min != null && max != null) {
+      if (min === 0 && max === 0) price = 'Price: free';
+      else if (min === max) price = `Price: ${min}`;
+      else price = `Price: ${min}–${max}`;
+    } else if (min != null) {
+      price = `Starting from ${min}`;
+    } else {
+      price = 'Price: not specified';
+    }
+    return [
+      `Service: ${s.name}`,
+      s.description ? `Description: ${s.description}` : '',
+      price,
+      s.price_note ? `Pricing note: ${s.price_note}` : '',
+      s.duration_minutes ? `Typical duration: ${s.duration_minutes} minutes` : '',
+    ].filter(Boolean).join('\n');
+  });
+  // Clear previous catalog chunks, then index ONE CHUNK PER SERVICE so a question
+  // about a single service can retrieve its own price instead of a truncated blob.
+  const oldChunks = q(`SELECT id FROM knowledge_chunks WHERE business_id = ? AND source_type = 'catalog'`, [businessId]);
+  for (const c of oldChunks) run('DELETE FROM knowledge_chunks_fts WHERE rowid = ?', [c.id]);
+  run(`DELETE FROM knowledge_chunks WHERE business_id = ? AND source_type = 'catalog'`, [businessId]);
+
+  let chunks = 0;
+  let embedded = 0;
+  let embedError = null;
+  for (let i = 0; i < services.length; i++) {
+    const r = await indexSource({
+      businessId,
+      sourceType: 'catalog',
+      sourceId: services[i].id,
+      title: services[i].name,
+      text: lines[i],
+      category: 'service',
+      embedModel: opts.embedModel,
+      skipEmbeddings: opts.skipEmbeddings,
+    });
+    chunks += r.chunks;
+    embedded += r.embedded;
+    embedError = embedError || r.embedError;
+  }
+  return { chunks, embedded, embedError };
+}
+
+// ---------------------------------------------------------------------------
+// Query building
+// ---------------------------------------------------------------------------
+
+const STOPWORDS = new Set([
+  'the', 'a', 'an', 'and', 'or', 'but', 'if', 'then', 'than', 'that', 'this', 'these', 'those',
+  'is', 'are', 'was', 'were', 'be', 'been', 'being', 'am', 'do', 'does', 'did', 'doing',
+  'have', 'has', 'had', 'having', 'i', 'me', 'my', 'we', 'our', 'you', 'your', 'it', 'its',
+  'to', 'of', 'in', 'on', 'at', 'for', 'with', 'about', 'as', 'by', 'from', 'up', 'down',
+  'what', 'which', 'who', 'whom', 'when', 'where', 'why', 'how', 'can', 'could', 'should',
+  'would', 'will', 'shall', 'may', 'might', 'must', 'not', 'no', 'yes', 'please', 'tell',
+  'give', 'show', 'list', 'any', 'all', 'some', 'there', 'here', 'much', 'many', 'more',
+  'most', 'other', 'into', 'out', 'over', 'under', 'again', 'also', 'just', 'only', 'very',
+  's', 't', 'us', 'so', 'such', 'own', 'same', 'too', 'off', 'while', 'during', 'before',
+  'after', 'above', 'below', 'between', 'need', 'needs', 'needed', 'want', 'get', 'got',
+  // domain noise: these appear in almost every knowledge entry, so they carry no signal
+  'business', 'businesses', 'company', 'currently', 'right', 'now', 'say', 'says', 'said',
+  'know', 'knows', 'thing', 'things', 'way', 'ways', 'able', 'actually', 'really',
+  // entity nouns: every business document mentions customers/staff/jobs, so matching
+  // only these is not evidence. Kept for FTS recall, excluded from content coverage.
+  'customer', 'customers', 'client', 'clients', 'staff', 'team', 'member', 'members',
+  'job', 'jobs', 'worker', 'workers', 'employee', 'employees', 'record', 'records',
+]);
+
+/** Crude suffix stripping so "policies" matches "policy" and "delaying" matches "delay". */
+function stem(term) {
+  let t = String(term).toLowerCase();
+  if (t.length > 4 && t.endsWith('ies')) return `${t.slice(0, -3)}y`;
+  if (t.length > 3 && t.endsWith('s') && !t.endsWith('ss')) t = t.slice(0, -1);
+  if (t.length > 5 && t.endsWith('ing')) t = t.slice(0, -3);
+  else if (t.length > 4 && t.endsWith('ed')) t = t.slice(0, -2);
+  return t;
+}
+
+/** Stemmed word set for a blob of text. */
+function wordSet(text) {
+  const set = new Set();
+  for (const w of String(text || '').toLowerCase().split(/[^\p{L}\p{N}]+/u)) {
+    if (w.length > 1) set.add(stem(w));
+  }
+  return set;
+}
+
+function tokenize(text) {
+  return String(text || '')
+    .toLowerCase()
+    // Hyphens and apostrophes are separators, not part of a word, so "tune-up"
+    // and "tune up" produce the same terms. Without this, an owner typing a
+    // hyphen into the search box would have to match the stored hyphen exactly.
+    .replace(/['\u2019-]+/g, ' ')
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
+    .split(/\s+/)
+    .filter((t) => t.length > 1 && !STOPWORDS.has(t));
+}
+
+/**
+ * Normalised multi-term matching for the Knowledge list search box.
+ *
+ * The previous implementation was `haystack.includes(query)`, which fails on the
+ * things owners actually type:
+ *   - "heat pump tune-up" missed an entry that says "Heat pump service" because
+ *     the phrase never appears contiguously;
+ *   - "diagnostic fees" missed "diagnostic fee";
+ *   - punctuation inside the query had to be reproduced exactly.
+ *
+ * This matcher normalises both sides (case, hyphens, punctuation, plural/simple
+ * stem), then requires EVERY meaningful query term to appear. Terms may be spread
+ * across the title and the content, which is what a person means by "search".
+ *
+ * Deliberate properties:
+ *   - an empty or all-stopword query returns null, meaning "no filtering", so an
+ *     empty search box shows everything rather than nothing;
+ *   - terms are ANDed, not ORed, so adding a word narrows instead of flooding;
+ *   - it is pure string work: no index, no service, no network.
+ *
+ * @returns {((fields: {title?: string, content?: string}) => boolean)|null}
+ */
+function makeKnowledgeMatcher(rawQuery) {
+  const terms = [...new Set(tokenize(rawQuery).map(stem))].filter(Boolean);
+  if (terms.length === 0) return null;
+
+  return (fields) => {
+    // Normalise exactly the same way as the query so both sides agree.
+    const haystackWords = wordSet(`${fields.title || ''} ${fields.content || ''}`);
+    return terms.every((t) => haystackWords.has(t));
+  };
+}
+
+/**
+ * Build a safe FTS5 MATCH expression from free text (never raw user input).
+ * Terms are stemmed and turned into prefix queries so "policies" matches "policy"
+ * and "delaying" matches "delay". Everything is quoted to neutralise FTS operators.
+ */
+function buildFtsQuery(text) {
+  const terms = [...new Set(tokenize(text).map(stem))].filter((t) => t.length > 1).slice(0, 24);
+  if (terms.length === 0) return null;
+  return terms.map((t) => `"${t.replace(/"/g, '""')}"*`).join(' OR ');
+}
+
+/**
+ * Supersession: which items are no longer current?
+ *
+ * An item is superseded when any other item in the same business names it in
+ * `supersedes_id`. This deliberately ignores the superseder's own status:
+ * archiving a replacement must NOT silently revive the policy it replaced, which
+ * would quietly serve a retired policy as if it were current.
+ *
+ * Chains need no special handling. In A <- B <- C, both A and B name a live
+ * superseder, so only C is current.
+ *
+ * Nothing is deleted. Superseded rows keep their text, provenance and chunks so
+ * the history of a policy remains auditable.
+ *
+ * @returns {Set<number>} ids of items that must not be cited as current fact
+ */
+function supersededItemIds(businessId) {
+  const rows = q(
+    `SELECT DISTINCT k.id AS id
+       FROM knowledge_items k
+       JOIN knowledge_items s ON s.supersedes_id = k.id
+      WHERE k.business_id = ? AND s.business_id = ?`,
+    [businessId, businessId]
+  );
+  return new Set(rows.map((r) => r.id));
+}
+
+/**
+ * Who superseded each item, for display and for explaining a conflict.
+ * @returns {Map<number, number>} olderId -> newest active superseder id
+ */
+function supersededByMap(businessId) {
+  const rows = q(
+    `SELECT k.id AS older_id, s.id AS newer_id, s.status AS newer_status, s.last_updated
+       FROM knowledge_items k
+       JOIN knowledge_items s ON s.supersedes_id = k.id
+      WHERE k.business_id = ? AND s.business_id = ?
+      ORDER BY (s.status = 'active') DESC, s.last_updated DESC`,
+    [businessId, businessId]
+  );
+  const map = new Map();
+  // The first row per older id wins: active superseders sort before archived ones.
+  for (const r of rows) if (!map.has(r.older_id)) map.set(r.older_id, r.newer_id);
+  return map;
+}
+
+/**
+ * Hybrid search over business knowledge for one business.
+ * @returns {{hits: Array, usedEmbeddings: boolean, embedError: string|null}}
+ */
+async function searchKnowledge({ businessId, query: queryText, limit = 8, embedModel, minScore = 0, intentCategories = null }) {
+  const ftsQuery = buildFtsQuery(queryText);
+  const scores = new Map(); // chunkId -> { fts, vec, row }
+  // Computed once, applied to both passes below. Filtering at this level means a
+  // superseded policy cannot enter the ranking through *either* the lexical or
+  // the vector route, and therefore cannot reach an evidence-only answer either.
+  const superseded = supersededItemIds(businessId);
+
+  // --- lexical pass ---
+  if (ftsQuery) {
+    try {
+      const rows = q(
+        `SELECT c.id, c.business_id, c.source_type, c.source_id, c.title, c.text, c.category,
+                c.injection_flag, c.injection_reason, bm25(knowledge_chunks_fts) AS rank
+         FROM knowledge_chunks_fts
+         JOIN knowledge_chunks c ON c.id = knowledge_chunks_fts.rowid
+         WHERE knowledge_chunks_fts MATCH ? AND c.business_id = ?
+         ORDER BY rank
+         LIMIT 60`,
+        [ftsQuery, businessId]
+      );
+      // SQLite bm25() is negative; more negative = better match.
+      const best = rows.length ? Math.max(...rows.map((r) => -r.rank)) : 1;
+      for (const r of rows) {
+        const rel = Math.max(0, -r.rank);
+        scores.set(r.id, { ...r, lexical: best > 0 ? Math.min(1, rel / best) : 0.5, vector: 0 });
+      }
+    } catch (err) {
+      // Malformed query should degrade to vector-only, not crash the assistant.
+      console.error('[retrieval] fts error:', err.message);
+    }
+  }
+
+  // --- semantic pass (optional) ---
+  let usedEmbeddings = false;
+  let embedError = null;
+  try {
+    const { vectors, model } = await ollama.embed([queryText], embedModel);
+    if (!model) {
+      // Unidentified embedding model: the vector pass cannot be attributed to a
+      // known space, so do not claim it ran. Full-text ranking still applies.
+      throw Object.assign(new Error('embedding model did not identify itself'), { code: 'EMBED_UNIDENTIFIED' });
+    }
+    const queryVec = Float32Array.from(vectors[0]);
+    const rows = q(
+      `SELECT e.chunk_id, e.vector FROM knowledge_embeddings e
+       WHERE e.business_id = ? AND e.model = ?`,
+      [businessId, model]
+    );
+    // Only embeddings stored under the model that just answered are comparable.
+    // Counting embeddings for the business as a whole would set this flag from
+    // stale vectors belonging to a different model, which were never ranked —
+    // claiming a retrieval configuration that was not actually used.
+    if (rows.length > 0) {
+      usedEmbeddings = true;
+      const sims = rows.map((r) => ({ chunk_id: r.chunk_id, sim: cosine(queryVec, blobToVec(r.vector)) }));
+      for (const s of sims) {
+        const existing = scores.get(s.chunk_id);
+        if (existing) existing.vector = s.sim;
+        else {
+          const row = get('SELECT * FROM knowledge_chunks WHERE id = ? AND business_id = ?', [s.chunk_id, businessId]);
+          if (row) scores.set(row.id, { ...row, rank: 0, lexical: 0, vector: s.sim });
+        }
+      }
+    }
+  } catch (err) {
+    embedError = err.code === 'EMBED_UNAVAILABLE' ? 'embedding-model-unavailable'
+      : err.code === 'EMBED_UNIDENTIFIED' ? 'embedding-model-unidentified'
+        : 'embedding-failed';
+  }
+
+  const queryTerms = [...new Set(tokenize(queryText))];
+  const queryStems = queryTerms.map(stem);
+  // Coverage is judged on terms that actually carry meaning. If the question is
+  // ONLY entity nouns ("how many customers"), contentTerms is empty and coverage
+  // is meaningless — such questions must be answered from records, not documents.
+  const CONTENT_STOP = new Set([
+    'customer', 'customers', 'client', 'clients', 'staff', 'team', 'member', 'members',
+    'job', 'jobs', 'how many', 'how much', 'many', 'much',
+  ]);
+  const contentTerms = queryTerms.filter((t) => !CONTENT_STOP.has(t));
+  const contentStems = contentTerms.map(stem);
+
+  const hits = [...scores.values()]
+    .map((r) => {
+      const bodyWords = wordSet(r.text);
+      const titleWords = wordSet(r.title);
+      const covered = contentTerms.filter((_t, i) => bodyWords.has(contentStems[i]) || titleWords.has(contentStems[i]));
+      const titleCovered = contentTerms.filter((_t, i) => titleWords.has(contentStems[i]));
+      const coverage = contentStems.length ? covered.length / contentStems.length : 0;
+      const titleCoverage = contentStems.length ? titleCovered.length / contentStems.length : 0;
+      const affinity = intentCategories && intentCategories.includes(r.category) ? 1 : 0;
+      const lexical = r.lexical || 0;
+      const vector = r.vector || 0;
+      return {
+        chunkId: r.id ?? r.chunk_id,
+        sourceType: r.source_type,
+        sourceId: r.source_id,
+        title: r.title,
+        category: r.category,
+        text: r.text,
+        injectionFlag: !!r.injection_flag,
+        injectionReason: r.injection_reason || '',
+        lexical,
+        vector,
+        coverage,
+        titleCoverage,
+        affinity,
+        matchedTerms: covered,
+        // Content overlap dominates, so a chunk must genuinely discuss the question.
+        score: 0.30 * lexical + 0.22 * vector + 0.28 * coverage + 0.12 * titleCoverage + 0.08 * affinity,
+      };
+    })
+    // Drop anything that shares no stem with the question (unless a very strong
+    // semantic match). This is what stopped unrelated policies surfacing.
+    .filter((h) => h.coverage > 0 || h.vector >= 0.78)
+    // A superseded item is history, not current fact. It is dropped from evidence
+    // regardless of how well it matches or how high it ranks — that is exactly the
+    // failure this guards against. Archived items never produce chunks, so this
+    // check also covers them.
+    .filter((h) => !(h.sourceType === 'item' && superseded.has(h.sourceId)))
+    .filter((h) => h.score >= minScore)
+    .sort((a, b) => b.score - a.score)
+    .slice(0, limit);
+
+  // Evidence tiers. `weak` may not be cited as support for a factual claim.
+  let evidenceTier = 'none';
+  if (hits.some((h) => h.coverage >= 0.3)) evidenceTier = 'strong';
+  else if (hits.some((h) => h.coverage >= 0.15)) evidenceTier = 'weak';
+
+  return { hits, usedEmbeddings, embedError, queryTerms, evidenceTier };
+}
+
+/**
+ * Fetch a knowledge item / document by id, scoped to the business.
+ * Used to enrich sources with recency + provenance for the answer payload.
+ */
+/**
+ * @param {number} businessId
+ * @param {object} hit
+ * @param {{superseded?: Set<number>, supersededBy?: Map<number, number>}} [precomputed]
+ *   Optional. When describing several hits, pass the sets computed once for the
+ *   business so this does not re-query for every source.
+ */
+function describeSource(businessId, hit, precomputed) {
+  if (hit.sourceType === 'item') {
+    const item = get('SELECT * FROM knowledge_items WHERE id = ? AND business_id = ?', [hit.sourceId, businessId]);
+    if (!item) return null;
+    return {
+      kind: 'knowledge',
+      id: item.id,
+      title: item.title || item.category,
+      category: item.category,
+      source: item.source,
+      sourceDetail: item.source_detail,
+      lastUpdated: item.last_updated,
+      status: item.status,
+      supersedesId: item.supersedes_id,
+      // True when a newer entry replaces this one. Such an item is never cited as
+      // current fact (searchKnowledge filters it out), but the flag is carried so
+      // any surface that lists historical entries can label them honestly.
+      superseded: (precomputed?.superseded ?? supersededItemIds(businessId)).has(item.id),
+      supersededBy: (precomputed?.supersededBy ?? supersededByMap(businessId)).get(item.id) ?? null,
+      snippet: sanitizeForPrompt(hit.text, 400),
+      flagged: hit.injectionFlag,
+      flaggedReason: hit.injectionReason,
+      score: Number(hit.score.toFixed(3)),
+    };
+  }
+  if (hit.sourceType === 'document') {
+    const doc = get('SELECT * FROM business_documents WHERE id = ? AND business_id = ?', [hit.sourceId, businessId]);
+    if (!doc) return null;
+    return {
+      kind: 'document',
+      id: doc.id,
+      title: doc.filename,
+      category: 'document',
+      source: 'document',
+      sourceDetail: doc.filename,
+      lastUpdated: doc.last_updated,
+      status: 'active',
+      snippet: sanitizeForPrompt(hit.text, 400),
+      flagged: hit.injectionFlag,
+      flaggedReason: hit.injectionReason,
+      score: Number(hit.score.toFixed(3)),
+    };
+  }
+  if (hit.sourceType === 'catalog') {
+    const svc = get('SELECT * FROM business_services WHERE id = ? AND business_id = ?', [hit.sourceId, businessId]);
+    if (!svc) return null;
+    return {
+      kind: 'service_catalog',
+      id: svc.id,
+      title: svc.name,
+      category: 'service',
+      source: 'catalog',
+      sourceDetail: 'Business services list',
+      lastUpdated: svc.last_updated,
+      status: 'active',
+      snippet: sanitizeForPrompt(hit.text, 400),
+      flagged: hit.injectionFlag,
+      flaggedReason: hit.injectionReason,
+      score: Number(hit.score.toFixed(3)),
+    };
+  }
+  return null;
+}
+
+module.exports = {
+  chunkText,
+  indexSource,
+  reindexItem,
+  reindexDocument,
+  reindexServiceCatalog,
+  deleteChunksFor,
+  bumpKnowledgeVersion,
+  getKnowledgeVersion,
+  searchKnowledge,
+  describeSource,
+  buildFtsQuery,
+  makeKnowledgeMatcher,
+  supersededItemIds,
+  supersededByMap,
+  tokenize,
+  stem,
+  wordSet,
+  cosine,
+  vecToBlob,
+  blobToVec,
+};

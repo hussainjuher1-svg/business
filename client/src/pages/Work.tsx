@@ -149,6 +149,7 @@ function EstimateForm({ customers, onClose, onSaved }: any) {
 function Appointments({ customers, refreshKey, onChanged }: any) {
   const { rows, loading, error } = useList('/appointments', refreshKey);
   const [showForm, setShowForm] = useState(false);
+  const [editing, setEditing] = useState<any | null>(null);
   async function setStatus(id: number, status: string) {
     await api.patch(`/appointments/${id}`, { status });
     onChanged();
@@ -164,6 +165,7 @@ function Appointments({ customers, refreshKey, onChanged }: any) {
               <p className="truncate text-xs text-stone-500">{fmtDateTime(r.starts_at)}{r.customer_name ? ` · ${r.customer_name}` : ''}{r.location ? ` · ${r.location}` : ''}</p>
             </div>
             <div className="flex items-center gap-2">
+              <button className="btn-secondary !px-3 !py-1.5 text-xs" onClick={() => setEditing(r)}>Reschedule</button>
               <select value={r.status} onChange={(e) => setStatus(r.id, e.target.value)} className="max-w-[220px] py-1.5 text-xs">
                 {APPT_STATUSES.map((s) => <option key={s} value={s}>{s.replace(/_/g, ' ')}</option>)}
               </select>
@@ -173,12 +175,34 @@ function Appointments({ customers, refreshKey, onChanged }: any) {
         ))}
       </ListShell>
       {showForm && <AppointmentForm customers={customers} onClose={() => setShowForm(false)} onSaved={() => { setShowForm(false); onChanged(); }} />}
+      {editing && (
+        <AppointmentForm
+          customers={customers}
+          appointment={editing}
+          onClose={() => setEditing(null)}
+          onSaved={() => { setEditing(null); onChanged(); }}
+        />
+      )}
     </div>
   );
 }
 
-function AppointmentForm({ customers, onClose, onSaved }: any) {
-  const [form, setForm] = useState({ title: '', startsAt: '', endsAt: '', customerId: '', location: '', instructions: '' });
+/** "YYYY-MM-DD HH:MM:SS" (how the API returns timestamps) -> datetime-local value. */
+function toLocalInput(s?: string | null) {
+  if (!s) return '';
+  return String(s).replace(' ', 'T').slice(0, 16);
+}
+
+function AppointmentForm({ customers, appointment, onClose, onSaved }: any) {
+  const editing = !!appointment;
+  const [form, setForm] = useState({
+    title: appointment?.title || '',
+    startsAt: toLocalInput(appointment?.starts_at),
+    endsAt: toLocalInput(appointment?.ends_at),
+    customerId: appointment?.customer_id ? String(appointment.customer_id) : '',
+    location: appointment?.location || '',
+    instructions: appointment?.instructions || '',
+  });
   const [error, setError] = useState('');
   const [saving, setSaving] = useState(false);
   async function submit(e: React.FormEvent) {
@@ -186,27 +210,44 @@ function AppointmentForm({ customers, onClose, onSaved }: any) {
     setSaving(true);
     setError('');
     try {
-      await api.post('/appointments', {
-        title: form.title, startsAt: form.startsAt, endsAt: form.endsAt || null,
-        customerId: form.customerId ? Number(form.customerId) : null,
-        location: form.location, instructions: form.instructions,
-      });
+      if (editing) {
+        // Rescheduling touches the date and time only, and only the ones that
+        // actually changed. Sending an untouched field back would rewrite it in
+        // the browser's shorter form (seconds dropped), which would be a silent
+        // edit to data the user never touched. Fields that did not change are
+        // therefore omitted from the request entirely.
+        const patch: { startsAt?: string; endsAt?: string | null } = {};
+        if (form.startsAt !== toLocalInput(appointment.starts_at)) patch.startsAt = form.startsAt;
+        if (form.endsAt !== toLocalInput(appointment.ends_at)) patch.endsAt = form.endsAt || null;
+        if (!patch.startsAt && patch.endsAt === undefined) {
+          onClose(); // nothing to save; leave the record exactly as it was
+          return;
+        }
+        await api.patch(`/appointments/${appointment.id}`, patch);
+      } else {
+        await api.post('/appointments', {
+          title: form.title, startsAt: form.startsAt, endsAt: form.endsAt || null,
+          customerId: form.customerId ? Number(form.customerId) : null,
+          location: form.location, instructions: form.instructions,
+        });
+      }
       onSaved();
     } catch (err: any) { setError(err.message); } finally { setSaving(false); }
   }
   return (
-    <Modal title="New appointment" onClose={onClose}>
+    <Modal title={editing ? 'Reschedule appointment' : 'New appointment'} onClose={onClose}>
       <form onSubmit={submit} className="space-y-3">
         {error && <ErrorBox message={error} />}
-        <Field label="Title *"><input required value={form.title} onChange={(e) => setForm({ ...form, title: e.target.value })} /></Field>
+        <Field label="Title *"><input required value={form.title} disabled={editing} onChange={(e) => setForm({ ...form, title: e.target.value })} /></Field>
         <div className="grid grid-cols-2 gap-3">
           <Field label="Starts at *"><input required type="datetime-local" value={form.startsAt} onChange={(e) => setForm({ ...form, startsAt: e.target.value })} /></Field>
           <Field label="Ends at"><input type="datetime-local" value={form.endsAt} onChange={(e) => setForm({ ...form, endsAt: e.target.value })} /></Field>
         </div>
-        <Field label="Customer"><select value={form.customerId} onChange={(e) => setForm({ ...form, customerId: e.target.value })}><option value="">None</option>{customers.map((c: any) => <option key={c.id} value={c.id}>{c.name}</option>)}</select></Field>
-        <Field label="Location"><input value={form.location} onChange={(e) => setForm({ ...form, location: e.target.value })} /></Field>
-        <Field label="Instructions"><textarea rows={2} value={form.instructions} onChange={(e) => setForm({ ...form, instructions: e.target.value })} /></Field>
-        <div className="flex justify-end gap-2"><button type="button" className="btn-secondary" onClick={onClose}>Cancel</button><button className="btn-primary" disabled={saving}>{saving ? 'Saving…' : 'Save appointment'}</button></div>
+        <Field label="Customer"><select value={form.customerId} disabled={editing} onChange={(e) => setForm({ ...form, customerId: e.target.value })}><option value="">None</option>{customers.map((c: any) => <option key={c.id} value={c.id}>{c.name}</option>)}</select></Field>
+        <Field label="Location"><input value={form.location} disabled={editing} onChange={(e) => setForm({ ...form, location: e.target.value })} /></Field>
+        <Field label="Instructions"><textarea rows={2} value={form.instructions} disabled={editing} onChange={(e) => setForm({ ...form, instructions: e.target.value })} /></Field>
+        {editing && <p className="text-[11px] text-stone-500">Only the date and time change. The customer, location, instructions and status stay as they are.</p>}
+        <div className="flex justify-end gap-2"><button type="button" className="btn-secondary" onClick={onClose}>Cancel</button><button className="btn-primary" disabled={saving}>{saving ? 'Saving…' : editing ? 'Save new time' : 'Save appointment'}</button></div>
       </form>
     </Modal>
   );

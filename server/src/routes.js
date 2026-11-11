@@ -1,15 +1,77 @@
 const express = require('express');
 const { z } = require('zod');
 const { q, get, run, logActivity } = require('./db');
-const { hashPassword, verifyPassword, createSession, destroySession, getMemberships, requireAuth, resolveBusiness, requireRole, setSessionCookie, clearSessionCookie } = require('./auth');
+const { hashPassword, verifyPassword, createSession, destroySession, destroyAllSessions, getMemberships, requireAuth, resolveBusiness, requireRole, setSessionCookie, clearSessionCookie } = require('./auth');
+const loginGuard = require('./login-guard');
+const demoGuard = require('./demo-guard');
 
 const router = express.Router();
 
 const emailSchema = z.string().email('Invalid email address');
-const passwordSchema = z.string().min(8, 'Password must be at least 8 characters');
+
+/**
+ * Password policy for REAL accounts.
+ *
+ * Demo accounts are created by the seed scripts with a known password so the
+ * pilot can be demonstrated. Those credentials must never be reusable for a
+ * genuine business account, so registration refuses them explicitly, along with
+ * weak/guessable passwords.
+ */
+const DEMO_PASSWORDS = new Set([
+  'demo1234', 'password', 'password1', 'password123', '12345678', '123456789',
+  '1234567890', 'qwerty123', 'letmein1', 'welcome1', 'admin123', 'daybook123',
+]);
+
+const passwordSchema = z
+  .string()
+  .min(10, 'Password must be at least 10 characters')
+  .max(200, 'Password is too long')
+  .superRefine((val, ctx) => {
+    if (DEMO_PASSWORDS.has(val.toLowerCase())) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'That password is a shared demo password and cannot be used for a real account. Choose something unique.',
+      });
+      return;
+    }
+    if (/^\d+$/.test(val)) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Password cannot be only numbers.' });
+      return;
+    }
+    if (/^(.)\1+$/.test(val)) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: 'Password cannot be a single repeated character.' });
+      return;
+    }
+    const classes = [/[a-z]/, /[A-Z]/, /\d/, /[^A-Za-z0-9]/].filter((re) => re.test(val)).length;
+    if (classes < 2) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: 'Password must mix at least two of: lowercase letters, uppercase letters, numbers, symbols.',
+      });
+    }
+  });
 
 function fail(res, status, error, extra = {}) {
   return res.status(status).json({ error, ...extra });
+}
+
+/**
+ * An assignee must be someone who actually belongs to this business.
+ *
+ * `assigned_to` is a foreign key to users(id), so an id that does not exist used
+ * to surface as a 500 from the constraint rather than a clean 400 — and an id
+ * that exists but belongs to another business would have been accepted. Both are
+ * client errors, so they are answered as such.
+ *
+ * Returns an error message, or null when the value is acceptable.
+ */
+function invalidAssignee(businessId, assignedTo) {
+  if (assignedTo === undefined || assignedTo === null) return null; // "nobody"
+  const member = get(
+    'SELECT 1 AS ok FROM business_memberships WHERE business_id = ? AND user_id = ?',
+    [businessId, assignedTo]
+  );
+  return member ? null : 'assignedTo must be a member of this business.';
 }
 
 // ---------- helpers ----------
@@ -43,7 +105,7 @@ router.post('/auth/register', (req, res) => {
     name: z.string().min(1, 'Name is required'),
     businessName: z.string().min(1, 'Business name is required'),
   }).safeParse(req.body);
-  if (!parsed.success) return fail(res, 400, parsed.error.errors[0].message);
+  if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message);
   const { email, password, name, businessName } = parsed.data;
   const existing = get('SELECT id FROM users WHERE email = ?', [email.toLowerCase()]);
   if (existing) return fail(res, 409, 'An account with this email already exists. Try logging in.');
@@ -55,19 +117,77 @@ router.post('/auth/register', (req, res) => {
   logActivity(businessId, userId, 'business', businessId, 'created', `Business "${businessName}" created`);
   const token = createSession(userId);
   setSessionCookie(res, token);
-  res.status(201).json({ user: { id: userId, email, name }, businesses: getMemberships(userId) });
+  res.status(201).json({
+    user: { id: userId, email, name, isDemo: false, mustChangePassword: false },
+    businesses: getMemberships(userId),
+  });
 });
 
-router.post('/auth/login', (req, res) => {
+router.post('/auth/login', loginGuard.loginRateLimit, (req, res) => {
   const parsed = z.object({ email: emailSchema, password: z.string().min(1) }).safeParse(req.body);
-  if (!parsed.success) return fail(res, 400, parsed.error.errors[0].message);
-  const user = get('SELECT * FROM users WHERE email = ?', [parsed.data.email.toLowerCase()]);
+  if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message);
+  const email = parsed.data.email.toLowerCase();
+  const user = get('SELECT * FROM users WHERE email = ?', [email]);
+
   if (!user || !verifyPassword(parsed.data.password, user.password_hash)) {
+    loginGuard.recordFailure(req, email);
     return fail(res, 401, 'Invalid email or password.');
   }
+
+  loginGuard.recordSuccess(req, email);
   const token = createSession(user.id);
   setSessionCookie(res, token);
-  res.json({ user: { id: user.id, email: user.email, name: user.name }, businesses: getMemberships(user.id) });
+  res.json({
+    user: {
+      id: user.id,
+      email: user.email,
+      name: user.name,
+      isDemo: !!user.is_demo,
+      mustChangePassword: !!user.must_change_password,
+    },
+    businesses: getMemberships(user.id),
+  });
+});
+
+/**
+ * Forced password change (release blocker #3).
+ * Requires a valid session, verifies the current password, applies the shared
+ * policy, revokes all sessions, and issues a fresh one.
+ */
+router.post('/auth/change-password', requireAuth, (req, res) => {
+  const parsed = z.object({
+    currentPassword: z.string().min(1, 'Current password is required'),
+    newPassword: z.string().min(1, 'New password is required'),
+  }).safeParse(req.body);
+  if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message);
+
+  const user = get('SELECT * FROM users WHERE id = ?', [req.user.id]);
+  if (!user) return fail(res, 404, 'Account not found.');
+
+  if (!verifyPassword(parsed.data.currentPassword, user.password_hash)) {
+    loginGuard.recordFailure(req, user.email);
+    return fail(res, 401, 'Current password is incorrect.');
+  }
+
+  if (parsed.data.currentPassword === parsed.data.newPassword) {
+    return fail(res, 400, 'New password must be different from the current password.');
+  }
+
+  const problem = demoGuard.validateNewPassword(parsed.data.newPassword);
+  if (problem) return fail(res, 400, problem);
+
+  run(
+    `UPDATE users SET password_hash = ?, must_change_password = 0, password_changed_at = datetime('now'), updated_at = datetime('now')
+     WHERE id = ?`,
+    [hashPassword(parsed.data.newPassword), user.id]
+  );
+
+  // Force re-login everywhere with the new credential.
+  destroyAllSessions(user.id);
+  const token = createSession(user.id);
+  setSessionCookie(res, token);
+
+  res.json({ ok: true, mustChangePassword: false, user: { id: user.id, email: user.email, name: user.name } });
 });
 
 router.post('/auth/logout', requireAuth, (req, res) => {
@@ -77,7 +197,17 @@ router.post('/auth/logout', requireAuth, (req, res) => {
 });
 
 router.get('/auth/me', requireAuth, (req, res) => {
-  res.json({ user: { id: req.user.id, email: req.user.email, name: req.user.name }, businesses: getMemberships(req.user.id) });
+  res.json({
+    user: {
+      id: req.user.id,
+      email: req.user.email,
+      name: req.user.name,
+      isDemo: !!req.user.is_demo,
+      mustChangePassword: !!req.user.must_change_password,
+    },
+    businesses: getMemberships(req.user.id),
+    environment: demoGuard.isProduction() ? 'production' : 'development',
+  });
 });
 
 // ---------- businesses / settings ----------
@@ -106,17 +236,49 @@ router.patch('/business', requireAuth, resolveBusiness, requireRole('owner', 'ad
   res.json(get('SELECT * FROM businesses WHERE id = ?', [req.businessId]));
 });
 
-router.post('/business/services', requireAuth, resolveBusiness, requireRole('owner', 'admin'), (req, res) => {
-  const parsed = z.object({ name: z.string().min(1), description: z.string().optional().default('') }).safeParse(req.body);
-  if (!parsed.success) return fail(res, 400, parsed.error.errors[0].message);
-  const info = run('INSERT INTO business_services (business_id, name, description) VALUES (?,?,?)', [req.businessId, parsed.data.name, parsed.data.description]);
-  logActivity(req.businessId, req.user.id, 'service', Number(info.lastInsertRowid), 'created', parsed.data.name);
-  res.status(201).json(get('SELECT * FROM business_services WHERE id = ?', [Number(info.lastInsertRowid)]));
+// ---------- service catalog (legacy paths, retained for compatibility) ----------
+//
+// These paths are kept so an installed copy or an existing bookmark does not
+// break, but they are no longer a separate implementation. They delegate to the
+// canonical handlers in knowledge.js, which means a service created here now gets
+// the same validation, the same pricing fields and the same reindexing as one
+// created from the Services & pricing tab.
+//
+// The old version accepted only name+description, so anything created through
+// Business Settings lost its pricing and never entered the knowledge index —
+// a silent data-quality bug, not just a stylistic inconsistency.
+//
+// We deliberately did NOT delete these routes: removing them would break clients
+// mid-flight. Deprecation is signalled through headers instead, and a single
+// implementation means the two paths can no longer disagree.
+function markDeprecated(res, canonical) {
+  res.set('Deprecation', 'true');
+  res.set('Link', `<${canonical}>; rel="successor-version"`);
+}
+
+router.post('/business/services', requireAuth, resolveBusiness, requireRole('owner', 'admin'), (req, res, next) => {
+  markDeprecated(res, '/api/knowledge/services');
+  const knowledge = require('./knowledge');
+  knowledge.createService(req, res).catch(next);
 });
 
-router.delete('/business/services/:id', requireAuth, resolveBusiness, requireRole('owner', 'admin'), (req, res) => {
-  run('DELETE FROM business_services WHERE id = ? AND business_id = ?', [req.params.id, req.businessId]);
-  res.json({ ok: true });
+router.patch('/business/services/:id', requireAuth, resolveBusiness, requireRole('owner', 'admin'), (req, res, next) => {
+  markDeprecated(res, '/api/knowledge/services');
+  const knowledge = require('./knowledge');
+  knowledge.updateService(req, res).catch(next);
+});
+
+router.delete('/business/services/:id', requireAuth, resolveBusiness, requireRole('owner', 'admin'), (req, res, next) => {
+  markDeprecated(res, '/api/knowledge/services');
+  const knowledge = require('./knowledge');
+  knowledge.deleteService(req, res).catch(next);
+});
+
+// Expose the canonical list at the legacy address too, so a client that lists
+// services here sees exactly the same rows as the Services & pricing tab.
+router.get('/business/services', requireAuth, resolveBusiness, (req, res) => {
+  markDeprecated(res, '/api/knowledge/services');
+  res.json({ services: q('SELECT * FROM business_services WHERE business_id = ? ORDER BY name', [req.businessId]) });
 });
 
 // ---------- staff ----------
@@ -126,7 +288,7 @@ router.post('/business/staff', requireAuth, resolveBusiness, requireRole('owner'
     name: z.string().min(1),
     role: z.enum(['owner', 'admin', 'staff']).default('staff'),
   }).safeParse(req.body);
-  if (!parsed.success) return fail(res, 400, parsed.error.errors[0].message);
+  if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message);
   let user = get('SELECT * FROM users WHERE email = ?', [parsed.data.email.toLowerCase()]);
   if (!user) {
     const info = run('INSERT INTO users (email, password_hash, name) VALUES (?,?,?)', [parsed.data.email.toLowerCase(), hashPassword(cryptoRandom()), parsed.data.name]);
@@ -145,7 +307,7 @@ function cryptoRandom() {
 
 router.patch('/business/staff/:userId', requireAuth, resolveBusiness, requireRole('owner', 'admin'), (req, res) => {
   const parsed = z.object({ role: z.enum(['owner', 'admin', 'staff']) }).safeParse(req.body);
-  if (!parsed.success) return fail(res, 400, parsed.error.errors[0].message);
+  if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message);
   run('UPDATE business_memberships SET role = ? WHERE business_id = ? AND user_id = ?', [parsed.data.role, req.businessId, req.params.userId]);
   res.json({ ok: true });
 });
@@ -172,7 +334,7 @@ router.post('/customers', requireAuth, resolveBusiness, (req, res) => {
     address: z.string().optional().default(''),
     notes: z.string().optional().default(''),
   }).safeParse(req.body);
-  if (!parsed.success) return fail(res, 400, parsed.error.errors[0].message);
+  if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message);
   const d = parsed.data;
   // duplicate warning: same phone or email already exists
   const dup = get(
@@ -204,7 +366,7 @@ router.patch('/customers/:id', requireAuth, resolveBusiness, (req, res) => {
     phone: z.string().optional(), email: z.string().optional(),
     address: z.string().optional(), notes: z.string().optional(),
   }).safeParse(req.body);
-  if (!parsed.success) return fail(res, 400, parsed.error.errors[0].message);
+  if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message);
   const sets = Object.keys(parsed.data).map((k) => `${k} = ?`);
   if (!sets.length) return fail(res, 400, 'No fields to update.');
   sets.push("updated_at = datetime('now')");
@@ -221,13 +383,45 @@ router.delete('/customers/:id', requireAuth, resolveBusiness, (req, res) => {
 // ---------- inquiries ----------
 const INQUIRY_STATUSES = ['new', 'needs_response', 'in_progress', 'estimate_requested', 'converted', 'not_proceeding', 'archived'];
 router.get('/inquiries', requireAuth, resolveBusiness, (req, res) => {
-  const search = (req.query.search || '').toLowerCase();
+  const search = (req.query.search || '').toLowerCase().trim();
   const status = req.query.status;
+
+  // Assignment filter. `assignedTo=none` means "nobody owns this yet"; a numeric
+  // value means "show me that person's work". An unrecognised value is a client
+  // error rather than a silent no-op, because silently returning everything would
+  // look like the filter worked.
+  const assignedToRaw = req.query.assignedTo;
+  let assignment = 'any';
+  let assignedToId = null;
+  if (assignedToRaw !== undefined && assignedToRaw !== '') {
+    if (String(assignedToRaw).toLowerCase() === 'none') {
+      assignment = 'none';
+    } else if (/^\d+$/.test(String(assignedToRaw))) {
+      assignment = 'id';
+      assignedToId = Number(assignedToRaw);
+    } else {
+      return fail(res, 400, 'assignedTo must be "none" or a staff id.');
+    }
+  }
+
   let rows = q(`SELECT i.*, c.name AS customer_name FROM inquiries i LEFT JOIN customers c ON c.id = i.customer_id
     WHERE i.business_id = ? ORDER BY i.created_at DESC`, [req.businessId]);
+
+  // Filters compose: assignment AND status AND search, then pagination.
+  if (assignment === 'none') rows = rows.filter((r) => r.assigned_to === null || r.assigned_to === undefined);
+  else if (assignment === 'id') rows = rows.filter((r) => r.assigned_to === assignedToId);
   if (status) rows = rows.filter((r) => r.status === status);
-  if (search) rows = rows.filter((r) => [r.contact_name, r.phone, r.email, r.subject, r.message, r.customer_name].join(' ').toLowerCase().includes(search));
-  res.json(paginate(req, rows));
+  if (search) {
+    rows = rows.filter((r) => [r.contact_name, r.phone, r.email, r.subject, r.message, r.customer_name]
+      .join(' ').toLowerCase().includes(search));
+  }
+
+  const page = paginate(req, rows);
+  res.json({
+    ...page,
+    // Echo the resolved filter so a UI can show what is actually applied.
+    filters: { assignedTo: assignment === 'id' ? assignedToId : assignment, status: status || null, search: search || null },
+  });
 });
 
 router.post('/inquiries', requireAuth, resolveBusiness, (req, res) => {
@@ -242,7 +436,7 @@ router.post('/inquiries', requireAuth, resolveBusiness, (req, res) => {
     assignedTo: z.number().int().nullable().optional(),
     followUpDate: z.string().nullable().optional(),
   }).safeParse(req.body);
-  if (!parsed.success) return fail(res, 400, parsed.error.errors[0].message);
+  if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message);
   const d = parsed.data;
   const info = run(`INSERT INTO inquiries (business_id, customer_id, contact_name, phone, email, source, subject, message, status, assigned_to, follow_up_date)
     VALUES (?,?,?,?,?,?,?,?, 'new', ?, ?)`,
@@ -269,7 +463,9 @@ router.patch('/inquiries/:id', requireAuth, resolveBusiness, (req, res) => {
     assignedTo: z.number().int().nullable().optional(),
     followUpDate: z.string().nullable().optional(),
   }).safeParse(req.body);
-  if (!parsed.success) return fail(res, 400, parsed.error.errors[0].message);
+  if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message);
+  const badAssignee = invalidAssignee(req.businessId, parsed.data.assignedTo);
+  if (badAssignee) return fail(res, 400, badAssignee);
   const map = { contactName: 'contact_name', customerId: 'customer_id', assignedTo: 'assigned_to', followUpDate: 'follow_up_date' };
   const sets = [];
   const params = [];
@@ -328,7 +524,7 @@ router.post('/estimates', requireAuth, resolveBusiness, (req, res) => {
     followUpDate: z.string().nullable().optional(),
     notes: z.string().optional().default(''),
   }).safeParse(req.body);
-  if (!parsed.success) return fail(res, 400, parsed.error.errors[0].message);
+  if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message);
   const d = parsed.data;
   const biz = get('SELECT currency FROM businesses WHERE id = ?', [req.businessId]);
   const info = run(`INSERT INTO estimates (business_id, customer_id, inquiry_id, title, description, amount, currency, status, issue_date, valid_until, follow_up_date, notes)
@@ -355,7 +551,7 @@ router.patch('/estimates/:id', requireAuth, resolveBusiness, (req, res) => {
     issueDate: z.string().nullable().optional(), validUntil: z.string().nullable().optional(),
     followUpDate: z.string().nullable().optional(), notes: z.string().optional(),
   }).safeParse(req.body);
-  if (!parsed.success) return fail(res, 400, parsed.error.errors[0].message);
+  if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message);
   const map = { customerId: 'customer_id', inquiryId: 'inquiry_id', issueDate: 'issue_date', validUntil: 'valid_until', followUpDate: 'follow_up_date' };
   const sets = [];
   const params = [];
@@ -395,7 +591,7 @@ router.post('/appointments', requireAuth, resolveBusiness, (req, res) => {
     instructions: z.string().optional().default(''),
     assignedTo: z.number().int().nullable().optional(),
   }).safeParse(req.body);
-  if (!parsed.success) return fail(res, 400, parsed.error.errors[0].message);
+  if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message);
   const d = parsed.data;
   const info = run(`INSERT INTO appointments (business_id, customer_id, job_id, title, starts_at, ends_at, location, instructions, status, assigned_to)
     VALUES (?,?,?,?,?,?,?,?, 'scheduled', ?)`,
@@ -407,13 +603,17 @@ router.post('/appointments', requireAuth, resolveBusiness, (req, res) => {
 
 router.patch('/appointments/:id', requireAuth, resolveBusiness, (req, res) => {
   const parsed = z.object({
-    title: z.string().min(1).optional(), startsAt: z.string().optional(), endsAt: z.string().nullable().optional(),
+    // A start time is required, so an empty string must be refused rather than
+    // written over a valid one and leaving the appointment with no slot.
+    title: z.string().min(1).optional(), startsAt: z.string().min(1, 'Start date/time cannot be empty').optional(), endsAt: z.string().nullable().optional(),
     status: z.enum(APPT_STATUSES).optional(),
     customerId: z.number().int().nullable().optional(), jobId: z.number().int().nullable().optional(),
     location: z.string().optional(), instructions: z.string().optional(),
     assignedTo: z.number().int().nullable().optional(),
   }).safeParse(req.body);
-  if (!parsed.success) return fail(res, 400, parsed.error.errors[0].message);
+  if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message);
+  const badApptAssignee = invalidAssignee(req.businessId, parsed.data.assignedTo);
+  if (badApptAssignee) return fail(res, 400, badApptAssignee);
   const map = { startsAt: 'starts_at', endsAt: 'ends_at', customerId: 'customer_id', jobId: 'job_id', assignedTo: 'assigned_to' };
   const sets = [];
   const params = [];
@@ -452,7 +652,7 @@ router.post('/jobs', requireAuth, resolveBusiness, (req, res) => {
     scheduledDate: z.string().nullable().optional(),
     assignedTo: z.number().int().nullable().optional(),
   }).safeParse(req.body);
-  if (!parsed.success) return fail(res, 400, parsed.error.errors[0].message);
+  if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message);
   const d = parsed.data;
   const info = run(`INSERT INTO jobs (business_id, customer_id, inquiry_id, estimate_id, title, description, status, scheduled_date, assigned_to)
     VALUES (?,?,?,?,?,?, 'not_started', ?, ?)`,
@@ -470,7 +670,9 @@ router.patch('/jobs/:id', requireAuth, resolveBusiness, (req, res) => {
     estimateId: z.number().int().nullable().optional(),
     scheduledDate: z.string().nullable().optional(), assignedTo: z.number().int().nullable().optional(),
   }).safeParse(req.body);
-  if (!parsed.success) return fail(res, 400, parsed.error.errors[0].message);
+  if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message);
+  const badJobAssignee = invalidAssignee(req.businessId, parsed.data.assignedTo);
+  if (badJobAssignee) return fail(res, 400, badJobAssignee);
   const map = { customerId: 'customer_id', inquiryId: 'inquiry_id', estimateId: 'estimate_id', scheduledDate: 'scheduled_date', assignedTo: 'assigned_to' };
   const sets = [];
   const params = [];
@@ -507,7 +709,7 @@ router.post('/follow-ups', requireAuth, resolveBusiness, (req, res) => {
     jobId: z.number().int().nullable().optional(),
     assignedTo: z.number().int().nullable().optional(),
   }).safeParse(req.body);
-  if (!parsed.success) return fail(res, 400, parsed.error.errors[0].message);
+  if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message);
   const d = parsed.data;
   const info = run(`INSERT INTO follow_ups (business_id, customer_id, inquiry_id, estimate_id, job_id, title, notes, due_date, assigned_to, status)
     VALUES (?,?,?,?,?,?,?,?,?, 'open')`,
@@ -523,7 +725,7 @@ router.patch('/follow-ups/:id', requireAuth, resolveBusiness, (req, res) => {
     dueDate: z.string().optional(), status: z.enum(['open', 'completed', 'rescheduled']).optional(),
     assignedTo: z.number().int().nullable().optional(),
   }).safeParse(req.body);
-  if (!parsed.success) return fail(res, 400, parsed.error.errors[0].message);
+  if (!parsed.success) return fail(res, 400, parsed.error.issues[0].message);
   const map = { dueDate: 'due_date', assignedTo: 'assigned_to' };
   const sets = [];
   const params = [];
@@ -567,15 +769,114 @@ router.get('/dashboard', requireAuth, resolveBusiness, (req, res) => {
     WHERE j.business_id = ? AND date(j.scheduled_date) = date(?) AND j.status NOT IN ('completed','cancelled') ORDER BY j.created_at ASC`, [req.businessId, today]);
   const weekInquiries = q(`SELECT * FROM inquiries WHERE business_id = ? AND date(created_at) >= date(?) ORDER BY created_at DESC`, [req.businessId, weekStart]);
 
+  // ---- Overdue estimate follow-ups ----
+  //
+  // Deliberately NOT "expired". An expired estimate has passed `valid_until`;
+  // an overdue follow-up is one the owner planned to chase and has not chased
+  // yet, whatever its validity. Conflating the two would nag about quotes that
+  // were already sent to the customer for a decision.
+  //
+  //   pending statuses (not accepted/declined/expired)
+  //   AND follow_up_date is non-null          <- nothing scheduled, nothing overdue
+  //   AND follow_up_date < the business-local current date
+  //
+  // The comparison uses the business-local 'today' for the same reason every
+  // other date on this dashboard does: a business east of UTC is already
+  // tomorrow while the server is still on yesterday.
+  const overdueEstimateFollowUps = q(
+    `SELECT e.*, c.name AS customer_name
+       FROM estimates e LEFT JOIN customers c ON c.id = e.customer_id
+      WHERE e.business_id = ?
+        AND e.status IN ('sent','awaiting_response','follow_up_needed')
+        AND e.follow_up_date IS NOT NULL
+        AND date(e.follow_up_date) < date(?)
+      ORDER BY e.follow_up_date ASC`,
+    [req.businessId, today]
+  );
+
+  // Estimates past their validity that are still pending. Reported separately so
+  // an expired quote is never counted as an overdue follow-up.
+  const expiredEstimates = q(
+    `SELECT e.*, c.name AS customer_name
+       FROM estimates e LEFT JOIN customers c ON c.id = e.customer_id
+      WHERE e.business_id = ?
+        AND e.status IN ('sent','awaiting_response','follow_up_needed')
+        AND e.valid_until IS NOT NULL
+        AND date(e.valid_until) < date(?)
+      ORDER BY e.valid_until ASC`,
+    [req.businessId, today]
+  );
+
+  // ---- Unassigned, still-actionable inquiries ----
+  //
+  // "Actionable" excludes anything already resolved, so the count reflects work
+  // that someone still has to pick up.
+  const ACTIONABLE_INQUIRY_STATUSES = ['new', 'needs_response', 'in_progress', 'estimate_requested'];
+  const unassignedInquiries = q(
+    `SELECT i.* FROM inquiries i
+      WHERE i.business_id = ?
+        AND i.assigned_to IS NULL
+        AND i.status IN (${ACTIONABLE_INQUIRY_STATUSES.map(() => '?').join(',')})
+      ORDER BY i.created_at ASC`,
+    [req.businessId, ...ACTIONABLE_INQUIRY_STATUSES]
+  );
+
   const attention = [];
-  for (const i of newInquiries) attention.push({ type: 'inquiry', id: i.id, title: `New inquiry: ${i.contact_name}`, detail: i.subject || i.message?.slice(0, 80) || '', date: i.created_at, link: `/inquiries/${i.id}` });
-  for (const e of pendingEstimates) attention.push({ type: 'estimate', id: e.id, title: `Estimate awaiting follow-up: ${e.title}`, detail: e.customer_name ? `Customer: ${e.customer_name}` : '', date: e.follow_up_date || e.created_at, link: `/work/estimates` });
+  // One entry per underlying problem. The pending-estimate loop below skips an
+  // estimate that is already listed as overdue, so the same quote cannot appear
+  // twice under two different headings.
+  const overdueEstimateIds = new Set(overdueEstimateFollowUps.map((e) => e.id));
+  const unassignedInquiryIds = new Set(unassignedInquiries.map((i) => i.id));
+
+  for (const i of newInquiries) {
+    // An unassigned inquiry is surfaced by the unassigned block below with a more
+    // useful title; listing it here too would be the same problem twice.
+    if (unassignedInquiryIds.has(i.id)) continue;
+    attention.push({ type: 'inquiry', id: i.id, title: `New inquiry: ${i.contact_name}`, detail: i.subject || i.message?.slice(0, 80) || '', date: i.created_at, link: `/inquiries/${i.id}` });
+  }
+
+  for (const e of overdueEstimateFollowUps) {
+    attention.push({
+      type: 'estimate_follow_up_overdue',
+      id: e.id,
+      title: `Overdue estimate follow-up: ${e.title}`,
+      detail: `${e.customer_name ? `Customer: ${e.customer_name} · ` : ''}was due ${String(e.follow_up_date).slice(0, 10)}`,
+      date: e.follow_up_date,
+      link: '/work/estimates',
+    });
+  }
+
+  for (const e of pendingEstimates) {
+    if (overdueEstimateIds.has(e.id)) continue;
+    attention.push({ type: 'estimate', id: e.id, title: `Estimate awaiting follow-up: ${e.title}`, detail: e.customer_name ? `Customer: ${e.customer_name}` : '', date: e.follow_up_date || e.created_at, link: '/work/estimates' });
+  }
+
+  for (const i of unassignedInquiries) {
+    attention.push({
+      type: 'inquiry_unassigned',
+      id: i.id,
+      title: `Unassigned inquiry: ${i.contact_name}`,
+      detail: i.subject || i.message?.slice(0, 80) || 'Nobody is handling this yet.',
+      date: i.created_at,
+      link: '/inquiries',
+    });
+  }
   for (const f of overdueFollowUps) attention.push({ type: 'follow_up', id: f.id, title: `Overdue follow-up: ${f.title}`, detail: f.customer_name ? `Customer: ${f.customer_name}` : '', date: f.due_date, link: `/work/follow-ups` });
   for (const a of unconfirmedAppts) attention.push({ type: 'appointment', id: a.id, title: `Unconfirmed appointment: ${a.title}`, detail: a.customer_name ? `Customer: ${a.customer_name}` : '', date: a.starts_at, link: `/work/appointments` });
 
   const nextSteps = [];
-  if (newInquiries.length) nextSteps.push({ text: `Respond to ${newInquiries.length} new ${newInquiries.length === 1 ? 'inquiry' : 'inquiries'}`, link: '/inquiries' });
-  if (pendingEstimates.length) nextSteps.push({ text: `Follow up on ${pendingEstimates.length} pending ${pendingEstimates.length === 1 ? 'estimate' : 'estimates'}`, link: '/work/estimates' });
+  // Counts here must partition the work, not double it. An overdue estimate is
+  // already "pending", so counting it in both lines would tell the owner there is
+  // more to do than there is. The overdue line claims its estimates; the pending
+  // line reports only the remainder.
+  const notOverduePendingEstimates = pendingEstimates.filter((e) => !overdueEstimateIds.has(e.id));
+  // Same split for inquiries: an unassigned inquiry is also a new one.
+  const assignedNewInquiries = newInquiries.filter((i) => !unassignedInquiryIds.has(i.id));
+
+  if (assignedNewInquiries.length) nextSteps.push({ text: `Respond to ${assignedNewInquiries.length} new ${assignedNewInquiries.length === 1 ? 'inquiry' : 'inquiries'}`, link: '/inquiries' });
+  if (notOverduePendingEstimates.length) nextSteps.push({ text: `Follow up on ${notOverduePendingEstimates.length} pending ${notOverduePendingEstimates.length === 1 ? 'estimate' : 'estimates'}`, link: '/work/estimates' });
+  if (overdueEstimateFollowUps.length) nextSteps.push({ text: `Chase ${overdueEstimateFollowUps.length} overdue estimate ${overdueEstimateFollowUps.length === 1 ? 'follow-up' : 'follow-ups'}`, link: '/work/estimates' });
+  if (unassignedInquiries.length) nextSteps.push({ text: `Assign ${unassignedInquiries.length} unassigned ${unassignedInquiries.length === 1 ? 'inquiry' : 'inquiries'}`, link: '/inquiries' });
   if (overdueFollowUps.length) nextSteps.push({ text: `Complete ${overdueFollowUps.length} overdue follow-up${overdueFollowUps.length === 1 ? '' : 's'}`, link: '/work/follow-ups' });
   if (dueTodayFollowUps.length) nextSteps.push({ text: `${dueTodayFollowUps.length} follow-up${dueTodayFollowUps.length === 1 ? '' : 's'} due today`, link: '/work/follow-ups' });
   if (unconfirmedAppts.length) nextSteps.push({ text: `Confirm ${unconfirmedAppts.length} upcoming appointment${unconfirmedAppts.length === 1 ? '' : 's'}`, link: '/work/appointments' });
@@ -596,7 +897,16 @@ router.get('/dashboard', requireAuth, resolveBusiness, (req, res) => {
       activeJobs: activeJobs.length,
       weekInquiries: weekInquiries.length,
       totalCustomers: get('SELECT COUNT(*) AS n FROM customers WHERE business_id = ?', [req.businessId])?.n || 0,
+      // New operational metrics. Each is a database count, not a client-side
+      // derived figure, so the number on screen is the number in the rows.
+      overdueEstimateFollowUps: overdueEstimateFollowUps.length,
+      expiredEstimates: expiredEstimates.length,
+      unassignedInquiries: unassignedInquiries.length,
     },
+    // The underlying rows, so a screen can list them without a second request.
+    overdueEstimateFollowUps,
+    expiredEstimates,
+    unassignedInquiries,
     weekInquiries,
   });
 });

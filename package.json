@@ -2,16 +2,31 @@
   "name": "daybook",
   "version": "1.0.0",
   "private": true,
-  "description": "Daybook — simple, intelligent business-management platform for small service businesses",
+  "description": "Daybook — simple, intelligent business-management platform with a local-only AI assistant",
   "scripts": {
     "install:all": "npm --prefix server install && npm --prefix client install",
-    "db:migrate": "node server/src/migrate.js",
-    "db:seed": "node server/seed.js",
-    "dev": "concurrently \"npm --prefix server run dev\" \"npm --prefix client run dev\"",
-    "start": "node server/src/index.js",
-    "build": "npm --prefix client run build"
+    "db:migrate": "node --no-warnings --env-file-if-exists=.env server/src/migrate.js",
+    "db:seed": "node --no-warnings --env-file-if-exists=.env server/seed.js",
+    "dev": "concurrently \"npm run dev:server\" \"npm --prefix client run dev\"",
+    "start": "node --no-warnings --env-file-if-exists=.env server/src/index.js",
+    "build": "npm --prefix client run build",
+    "test": "node --no-warnings --test server/test/assistant.test.js server/test/release-blockers.test.js server/test/security.test.js server/test/eval-harness.test.js server/test/local-inference-policy.test.js server/test/embedding-provenance.test.js server/test/supersession.test.js server/test/knowledge-search.test.js server/test/dashboard-attention.test.js server/test/service-catalog.test.js server/test/upload-security.test.js server/test/zod-migration.test.js server/test/async-route.test.js server/test/p1-workflow-repairs.test.js",
+    "test:blockers": "node --no-warnings --test server/test/release-blockers.test.js",
+    "test:security": "node --no-warnings --test server/test/security.test.js",
+    "seed:hvac": "node --no-warnings --env-file-if-exists=.env server/seed-hvac.js",
+    "validate:hvac": "node --no-warnings --env-file-if-exists=.env server/validate-hvac.js",
+    "audit:pilot": "node --no-warnings --env-file-if-exists=.env server/audit-pilot.js",
+    "verify:persistence": "bash server/verify-persistence.sh",
+    "dev:server": "node --no-warnings --env-file-if-exists=.env --watch server/src/index.js",
+    "eval:ollama": "node --no-warnings --env-file-if-exists=.env server/eval-ollama.js",
+    "test:evals": "node --no-warnings --test server/test/eval-harness.test.js",
+    "check:ollama": "node --no-warnings --env-file-if-exists=.env server/check-ollama.js",
+    "dataset:hvac": "node --no-warnings --env-file-if-exists=.env server/prepare-hvac-dataset.js"
   },
   "devDependencies": {
     "concurrently": "^9.1.0"
+  },
+  "engines": {
+    "node": ">=20.19.0"
   }
 }

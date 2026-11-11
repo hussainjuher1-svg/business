@@ -14,6 +14,21 @@ interface Dashboard {
   counts: any;
 }
 
+/**
+ * Human labels for attention types. The API sends stable machine keys so a client
+ * can branch on them; the badge must not show those keys to an owner. An unknown
+ * type falls back to the raw key rather than rendering nothing, so a new server
+ * type is visible instead of silently blank.
+ */
+const ATTENTION_LABEL: Record<string, string> = {
+  inquiry: 'New inquiry',
+  inquiry_unassigned: 'Unassigned',
+  estimate: 'Estimate',
+  estimate_follow_up_overdue: 'Overdue follow-up',
+  follow_up: 'Follow-up',
+  appointment: 'Appointment',
+};
+
 export default function Today({ go }: { go: (page: string) => void }) {
   const [data, setData] = useState<Dashboard | null>(null);
   const [error, setError] = useState('');
@@ -75,7 +90,9 @@ export default function Today({ go }: { go: (page: string) => void }) {
                     {a.detail && <p className="text-xs text-stone-500">{a.detail}</p>}
                     <p className="text-xs text-stone-400">{fmtDateTime(a.date)}</p>
                   </div>
-                  <span className="badge bg-amber-100 text-amber-900">{a.type}</span>
+                  <span className={`badge ${a.type === 'estimate_follow_up_overdue' ? 'bg-red-100 text-red-900' : 'bg-amber-100 text-amber-900'}`}>
+                    {ATTENTION_LABEL[a.type] || a.type}
+                  </span>
                 </li>
               ))}
             </ul>
