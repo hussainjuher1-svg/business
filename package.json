@@ -10,7 +10,7 @@
     "dev": "concurrently \"npm run dev:server\" \"npm --prefix client run dev\"",
     "start": "node --no-warnings --env-file-if-exists=.env server/src/index.js",
     "build": "npm --prefix client run build",
-    "test": "node --no-warnings --test server/test/assistant.test.js server/test/release-blockers.test.js server/test/security.test.js server/test/eval-harness.test.js server/test/local-inference-policy.test.js server/test/embedding-provenance.test.js",
+    "test": "node --no-warnings --test server/test/assistant.test.js server/test/release-blockers.test.js server/test/security.test.js server/test/eval-harness.test.js server/test/local-inference-policy.test.js server/test/embedding-provenance.test.js server/test/supersession.test.js server/test/knowledge-search.test.js server/test/dashboard-attention.test.js server/test/service-catalog.test.js",
     "test:blockers": "node --no-warnings --test server/test/release-blockers.test.js",
     "test:security": "node --no-warnings --test server/test/security.test.js",
     "seed:hvac": "node --no-warnings --env-file-if-exists=.env server/seed-hvac.js",

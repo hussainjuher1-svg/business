@@ -225,11 +225,26 @@ test('every figure in a non-model answer is traceable to a cited source', async 
   for (const q of questions) {
     const { data } = await chat(q, 'A');
     if (data.mode === 'local-model') continue; // covered by the model's grounding rules
-    const citedText = `${JSON.stringify(data.sources)} ${data.answer.split('Here is the evidence')[0]}`;
-    const figures = (data.answer.match(/\b\d{2,6}\b/g) || []).filter((n) => Number(n) >= 50);
+    // A figure is traceable if it appears in a cited source, in reference
+    // records mode ([R#]), or in a conflict's structured provenance. Conflict
+    // dates are real database values, so citing "the older entry from
+    // 2025-10-07" is provenance, not fabrication. Read them from the structured
+    // fields rather than from the human-readable sentence.
+    const provenance = (data.conflicts || [])
+      .flatMap((c) => [c.newerUpdatedAt, c.olderUpdatedAt, String(c.detail || '')])
+      .join(' ');
+    const citedText = `${JSON.stringify(data.sources)} ${provenance}`;
+    // Only the evidence portion can make claims about the business. The
+    // degraded-mode notice ("model not reachable at 127.0.0.1:11434") is a fixed
+    // system message, and counting its digits as fabricated figures would push a
+    // future author to loosen the real check.
+    const claimText = data.answer.includes('Here is the evidence I found instead:')
+      ? data.answer.split('Here is the evidence I found instead:')[1]
+      : data.answer;
+    const figures = (claimText.match(/\b\d{2,6}\b/g) || []).filter((n) => Number(n) >= 50);
     for (const f of figures) {
       assert.ok(
-        citedText.includes(f) || data.answer.includes(`[R`) ,
+        citedText.includes(f) || data.answer.includes(`[R`),
         `answer for "${q}" stated ${f} without a matching source`
       );
     }

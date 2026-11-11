@@ -1,0 +1,105 @@
+name: PR checks
+
+# Fast, deterministic checks that need no model, no network model access and no
+# credentials. Real-model validation is deliberately excluded: it depends on a
+# locally installed model, which a hosted runner does not have, and gating a PR
+# on it would produce either false failures or skipped checks passed off as
+# green.
+#
+# The API tests spin up their own server per suite against a temporary SQLite
+# database created in the runner's temp directory (see server/test/lib/
+# test-instance.js). They never open data/daybook.db, so no committed data or
+# developer state is touched.
+
+on:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-checks-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: Tests, validation, build
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    env:
+      CI: 'true'
+      # Keep every harness on a throwaway database. Nothing in this job is
+      # allowed to point at the repository's data directory.
+      DB_PATH: ${{ runner.temp }}/ci-daybook.db
+      NODE_NO_WARNINGS: '1'
+      # NODE_ENV is deliberately NOT set job-wide. Vite builds in development
+      # mode when NODE_ENV=test, which doubles the bundle and means the build
+      # step would never verify the production output. It is set only on the
+      # test step below.
+
+    steps:
+      - uses: actions/checkout@v4
+
+      # Node 22 matches package.json engines (>=20.19.0) and is the version the
+      # test suites were verified against locally.
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+
+      # This repo has three independent dependency trees (root tooling, server,
+      # client) rather than npm workspaces, so each one is installed from its own
+      # committed lockfile. `npm ci` is used deliberately: it installs exactly what
+      # the lockfile pins and fails if the lockfile and manifest disagree, which is
+      # what we want in CI.
+      - name: Install
+        run: |
+          npm ci
+          npm ci --prefix server
+          npm ci --prefix client
+
+      - name: Guard against the committed development database
+        run: |
+          if [ -e data/daybook.db ]; then
+            echo "data/daybook.db must not exist in the repository." >&2
+            exit 1
+          fi
+          echo "No development database present. Good."
+
+      # `node --test` silently ignores a listed file that does not exist and still
+      # exits 0, so a renamed or deleted suite would leave this job green with
+      # fewer tests than intended. Assert every suite named in the npm script is
+      # actually present before trusting the result.
+      - name: Verify every test suite exists
+        run: |
+          node -e "
+            const { scripts } = require('./package.json');
+            const files = [...scripts.test.matchAll(/server\/test\/[\w.-]+\.test\.js/g)].map((m) => m[0]);
+            const fs = require('node:fs');
+            const missing = files.filter((f) => !fs.existsSync(f));
+            if (missing.length) {
+              console.error('Test suites listed in npm test but missing from the repo:');
+              for (const f of missing) console.error('  - ' + f);
+              process.exit(1);
+            }
+            console.log('All ' + files.length + ' test suites present.');
+          "
+
+      - name: Unit and integration tests
+        env:
+          NODE_ENV: test
+        run: npm test
+
+      - name: HVAC lifecycle validation
+        run: npm run validate:hvac
+
+      - name: Pilot data audit
+        run: npm run audit:pilot
+
+      - name: Persistence verification
+        run: npm run verify:persistence
+
+      - name: Client build
+        run: npm run build

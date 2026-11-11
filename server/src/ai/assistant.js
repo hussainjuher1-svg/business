@@ -92,14 +92,22 @@ function findConflicts(businessId, hits) {
       const older = get('SELECT * FROM knowledge_items WHERE id = ? AND business_id = ?', [item.supersedes_id, businessId]);
       if (older) {
         seen.add(`sup:${item.id}`);
+        const newerDate = String(item.last_updated).slice(0, 10);
+        const olderDate = String(older.last_updated).slice(0, 10);
         conflicts.push({
           kind: 'superseded',
           category: item.category,
           title: item.title,
-          detail: `"${item.title || item.category}" (updated ${String(item.last_updated).slice(0, 10)}) replaces the older entry from ${String(older.last_updated).slice(0, 10)}.`,
+          detail: `"${item.title || item.category}" (updated ${newerDate}) replaces the older entry from ${olderDate}.`,
+          // The dates are also emitted as structured provenance. The `detail`
+          // string is only the human-readable form; a caller that needs to
+          // account for every figure in an answer should read these fields
+          // rather than parse the sentence.
+          newerUpdatedAt: newerDate,
+          olderUpdatedAt: olderDate,
           newerId: item.id,
           olderId: older.id,
-          explanation: 'Used the newer entry; the older one is treated as outdated.',
+          explanation: 'Used the newer entry; the older one is treated as outdated. The older entry is kept for your records and is never presented as current.',
         });
       }
     }
@@ -126,6 +134,8 @@ function findConflicts(businessId, hits) {
         category: item.category,
         title: item.title || item.category,
         detail: `Two active entries with the same name disagree ("${item.title || item.category}", updated ${aDate} and ${bDate}).`,
+        newerUpdatedAt: aDate,
+        olderUpdatedAt: bDate,
         newerId: aDate >= bDate ? item.id : rival.id,
         olderId: aDate >= bDate ? rival.id : item.id,
         explanation: 'Answered from the most recently updated entry. Please resolve the conflict in the Knowledge Center.',
@@ -533,7 +543,15 @@ async function answer({ businessId, userId, question, history = [], useCache = t
     });
   }
 
-  const knowledgeSources = usableHits.map((h) => retrieval.describeSource(businessId, h)).filter(Boolean);
+  // Supersession is a property of the business, not of a single hit, so compute it
+  // once and share it across every source description instead of re-querying.
+  const supersession = {
+    superseded: retrieval.supersededItemIds(businessId),
+    supersededBy: retrieval.supersededByMap(businessId),
+  };
+  const knowledgeSources = usableHits
+    .map((h) => retrieval.describeSource(businessId, h, supersession))
+    .filter(Boolean);
   const conflicts = findConflicts(businessId, usableHits);
   const allGaps = computeGaps(businessId);
   const warnings = [];

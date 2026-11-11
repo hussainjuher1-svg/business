@@ -217,17 +217,49 @@ router.patch('/business', requireAuth, resolveBusiness, requireRole('owner', 'ad
   res.json(get('SELECT * FROM businesses WHERE id = ?', [req.businessId]));
 });
 
-router.post('/business/services', requireAuth, resolveBusiness, requireRole('owner', 'admin'), (req, res) => {
-  const parsed = z.object({ name: z.string().min(1), description: z.string().optional().default('') }).safeParse(req.body);
-  if (!parsed.success) return fail(res, 400, parsed.error.errors[0].message);
-  const info = run('INSERT INTO business_services (business_id, name, description) VALUES (?,?,?)', [req.businessId, parsed.data.name, parsed.data.description]);
-  logActivity(req.businessId, req.user.id, 'service', Number(info.lastInsertRowid), 'created', parsed.data.name);
-  res.status(201).json(get('SELECT * FROM business_services WHERE id = ?', [Number(info.lastInsertRowid)]));
+// ---------- service catalog (legacy paths, retained for compatibility) ----------
+//
+// These paths are kept so an installed copy or an existing bookmark does not
+// break, but they are no longer a separate implementation. They delegate to the
+// canonical handlers in knowledge.js, which means a service created here now gets
+// the same validation, the same pricing fields and the same reindexing as one
+// created from the Services & pricing tab.
+//
+// The old version accepted only name+description, so anything created through
+// Business Settings lost its pricing and never entered the knowledge index —
+// a silent data-quality bug, not just a stylistic inconsistency.
+//
+// We deliberately did NOT delete these routes: removing them would break clients
+// mid-flight. Deprecation is signalled through headers instead, and a single
+// implementation means the two paths can no longer disagree.
+function markDeprecated(res, canonical) {
+  res.set('Deprecation', 'true');
+  res.set('Link', `<${canonical}>; rel="successor-version"`);
+}
+
+router.post('/business/services', requireAuth, resolveBusiness, requireRole('owner', 'admin'), (req, res, next) => {
+  markDeprecated(res, '/api/knowledge/services');
+  const knowledge = require('./knowledge');
+  knowledge.createService(req, res).catch(next);
 });
 
-router.delete('/business/services/:id', requireAuth, resolveBusiness, requireRole('owner', 'admin'), (req, res) => {
-  run('DELETE FROM business_services WHERE id = ? AND business_id = ?', [req.params.id, req.businessId]);
-  res.json({ ok: true });
+router.patch('/business/services/:id', requireAuth, resolveBusiness, requireRole('owner', 'admin'), (req, res, next) => {
+  markDeprecated(res, '/api/knowledge/services');
+  const knowledge = require('./knowledge');
+  knowledge.updateService(req, res).catch(next);
+});
+
+router.delete('/business/services/:id', requireAuth, resolveBusiness, requireRole('owner', 'admin'), (req, res, next) => {
+  markDeprecated(res, '/api/knowledge/services');
+  const knowledge = require('./knowledge');
+  knowledge.deleteService(req, res).catch(next);
+});
+
+// Expose the canonical list at the legacy address too, so a client that lists
+// services here sees exactly the same rows as the Services & pricing tab.
+router.get('/business/services', requireAuth, resolveBusiness, (req, res) => {
+  markDeprecated(res, '/api/knowledge/services');
+  res.json({ services: q('SELECT * FROM business_services WHERE business_id = ? ORDER BY name', [req.businessId]) });
 });
 
 // ---------- staff ----------
@@ -332,13 +364,45 @@ router.delete('/customers/:id', requireAuth, resolveBusiness, (req, res) => {
 // ---------- inquiries ----------
 const INQUIRY_STATUSES = ['new', 'needs_response', 'in_progress', 'estimate_requested', 'converted', 'not_proceeding', 'archived'];
 router.get('/inquiries', requireAuth, resolveBusiness, (req, res) => {
-  const search = (req.query.search || '').toLowerCase();
+  const search = (req.query.search || '').toLowerCase().trim();
   const status = req.query.status;
+
+  // Assignment filter. `assignedTo=none` means "nobody owns this yet"; a numeric
+  // value means "show me that person's work". An unrecognised value is a client
+  // error rather than a silent no-op, because silently returning everything would
+  // look like the filter worked.
+  const assignedToRaw = req.query.assignedTo;
+  let assignment = 'any';
+  let assignedToId = null;
+  if (assignedToRaw !== undefined && assignedToRaw !== '') {
+    if (String(assignedToRaw).toLowerCase() === 'none') {
+      assignment = 'none';
+    } else if (/^\d+$/.test(String(assignedToRaw))) {
+      assignment = 'id';
+      assignedToId = Number(assignedToRaw);
+    } else {
+      return fail(res, 400, 'assignedTo must be "none" or a staff id.');
+    }
+  }
+
   let rows = q(`SELECT i.*, c.name AS customer_name FROM inquiries i LEFT JOIN customers c ON c.id = i.customer_id
     WHERE i.business_id = ? ORDER BY i.created_at DESC`, [req.businessId]);
+
+  // Filters compose: assignment AND status AND search, then pagination.
+  if (assignment === 'none') rows = rows.filter((r) => r.assigned_to === null || r.assigned_to === undefined);
+  else if (assignment === 'id') rows = rows.filter((r) => r.assigned_to === assignedToId);
   if (status) rows = rows.filter((r) => r.status === status);
-  if (search) rows = rows.filter((r) => [r.contact_name, r.phone, r.email, r.subject, r.message, r.customer_name].join(' ').toLowerCase().includes(search));
-  res.json(paginate(req, rows));
+  if (search) {
+    rows = rows.filter((r) => [r.contact_name, r.phone, r.email, r.subject, r.message, r.customer_name]
+      .join(' ').toLowerCase().includes(search));
+  }
+
+  const page = paginate(req, rows);
+  res.json({
+    ...page,
+    // Echo the resolved filter so a UI can show what is actually applied.
+    filters: { assignedTo: assignment === 'id' ? assignedToId : assignment, status: status || null, search: search || null },
+  });
 });
 
 router.post('/inquiries', requireAuth, resolveBusiness, (req, res) => {
@@ -678,15 +742,114 @@ router.get('/dashboard', requireAuth, resolveBusiness, (req, res) => {
     WHERE j.business_id = ? AND date(j.scheduled_date) = date(?) AND j.status NOT IN ('completed','cancelled') ORDER BY j.created_at ASC`, [req.businessId, today]);
   const weekInquiries = q(`SELECT * FROM inquiries WHERE business_id = ? AND date(created_at) >= date(?) ORDER BY created_at DESC`, [req.businessId, weekStart]);
 
+  // ---- Overdue estimate follow-ups ----
+  //
+  // Deliberately NOT "expired". An expired estimate has passed `valid_until`;
+  // an overdue follow-up is one the owner planned to chase and has not chased
+  // yet, whatever its validity. Conflating the two would nag about quotes that
+  // were already sent to the customer for a decision.
+  //
+  //   pending statuses (not accepted/declined/expired)
+  //   AND follow_up_date is non-null          <- nothing scheduled, nothing overdue
+  //   AND follow_up_date < the business-local current date
+  //
+  // The comparison uses the business-local 'today' for the same reason every
+  // other date on this dashboard does: a business east of UTC is already
+  // tomorrow while the server is still on yesterday.
+  const overdueEstimateFollowUps = q(
+    `SELECT e.*, c.name AS customer_name
+       FROM estimates e LEFT JOIN customers c ON c.id = e.customer_id
+      WHERE e.business_id = ?
+        AND e.status IN ('sent','awaiting_response','follow_up_needed')
+        AND e.follow_up_date IS NOT NULL
+        AND date(e.follow_up_date) < date(?)
+      ORDER BY e.follow_up_date ASC`,
+    [req.businessId, today]
+  );
+
+  // Estimates past their validity that are still pending. Reported separately so
+  // an expired quote is never counted as an overdue follow-up.
+  const expiredEstimates = q(
+    `SELECT e.*, c.name AS customer_name
+       FROM estimates e LEFT JOIN customers c ON c.id = e.customer_id
+      WHERE e.business_id = ?
+        AND e.status IN ('sent','awaiting_response','follow_up_needed')
+        AND e.valid_until IS NOT NULL
+        AND date(e.valid_until) < date(?)
+      ORDER BY e.valid_until ASC`,
+    [req.businessId, today]
+  );
+
+  // ---- Unassigned, still-actionable inquiries ----
+  //
+  // "Actionable" excludes anything already resolved, so the count reflects work
+  // that someone still has to pick up.
+  const ACTIONABLE_INQUIRY_STATUSES = ['new', 'needs_response', 'in_progress', 'estimate_requested'];
+  const unassignedInquiries = q(
+    `SELECT i.* FROM inquiries i
+      WHERE i.business_id = ?
+        AND i.assigned_to IS NULL
+        AND i.status IN (${ACTIONABLE_INQUIRY_STATUSES.map(() => '?').join(',')})
+      ORDER BY i.created_at ASC`,
+    [req.businessId, ...ACTIONABLE_INQUIRY_STATUSES]
+  );
+
   const attention = [];
-  for (const i of newInquiries) attention.push({ type: 'inquiry', id: i.id, title: `New inquiry: ${i.contact_name}`, detail: i.subject || i.message?.slice(0, 80) || '', date: i.created_at, link: `/inquiries/${i.id}` });
-  for (const e of pendingEstimates) attention.push({ type: 'estimate', id: e.id, title: `Estimate awaiting follow-up: ${e.title}`, detail: e.customer_name ? `Customer: ${e.customer_name}` : '', date: e.follow_up_date || e.created_at, link: `/work/estimates` });
+  // One entry per underlying problem. The pending-estimate loop below skips an
+  // estimate that is already listed as overdue, so the same quote cannot appear
+  // twice under two different headings.
+  const overdueEstimateIds = new Set(overdueEstimateFollowUps.map((e) => e.id));
+  const unassignedInquiryIds = new Set(unassignedInquiries.map((i) => i.id));
+
+  for (const i of newInquiries) {
+    // An unassigned inquiry is surfaced by the unassigned block below with a more
+    // useful title; listing it here too would be the same problem twice.
+    if (unassignedInquiryIds.has(i.id)) continue;
+    attention.push({ type: 'inquiry', id: i.id, title: `New inquiry: ${i.contact_name}`, detail: i.subject || i.message?.slice(0, 80) || '', date: i.created_at, link: `/inquiries/${i.id}` });
+  }
+
+  for (const e of overdueEstimateFollowUps) {
+    attention.push({
+      type: 'estimate_follow_up_overdue',
+      id: e.id,
+      title: `Overdue estimate follow-up: ${e.title}`,
+      detail: `${e.customer_name ? `Customer: ${e.customer_name} · ` : ''}was due ${String(e.follow_up_date).slice(0, 10)}`,
+      date: e.follow_up_date,
+      link: '/work/estimates',
+    });
+  }
+
+  for (const e of pendingEstimates) {
+    if (overdueEstimateIds.has(e.id)) continue;
+    attention.push({ type: 'estimate', id: e.id, title: `Estimate awaiting follow-up: ${e.title}`, detail: e.customer_name ? `Customer: ${e.customer_name}` : '', date: e.follow_up_date || e.created_at, link: '/work/estimates' });
+  }
+
+  for (const i of unassignedInquiries) {
+    attention.push({
+      type: 'inquiry_unassigned',
+      id: i.id,
+      title: `Unassigned inquiry: ${i.contact_name}`,
+      detail: i.subject || i.message?.slice(0, 80) || 'Nobody is handling this yet.',
+      date: i.created_at,
+      link: '/inquiries',
+    });
+  }
   for (const f of overdueFollowUps) attention.push({ type: 'follow_up', id: f.id, title: `Overdue follow-up: ${f.title}`, detail: f.customer_name ? `Customer: ${f.customer_name}` : '', date: f.due_date, link: `/work/follow-ups` });
   for (const a of unconfirmedAppts) attention.push({ type: 'appointment', id: a.id, title: `Unconfirmed appointment: ${a.title}`, detail: a.customer_name ? `Customer: ${a.customer_name}` : '', date: a.starts_at, link: `/work/appointments` });
 
   const nextSteps = [];
-  if (newInquiries.length) nextSteps.push({ text: `Respond to ${newInquiries.length} new ${newInquiries.length === 1 ? 'inquiry' : 'inquiries'}`, link: '/inquiries' });
-  if (pendingEstimates.length) nextSteps.push({ text: `Follow up on ${pendingEstimates.length} pending ${pendingEstimates.length === 1 ? 'estimate' : 'estimates'}`, link: '/work/estimates' });
+  // Counts here must partition the work, not double it. An overdue estimate is
+  // already "pending", so counting it in both lines would tell the owner there is
+  // more to do than there is. The overdue line claims its estimates; the pending
+  // line reports only the remainder.
+  const notOverduePendingEstimates = pendingEstimates.filter((e) => !overdueEstimateIds.has(e.id));
+  // Same split for inquiries: an unassigned inquiry is also a new one.
+  const assignedNewInquiries = newInquiries.filter((i) => !unassignedInquiryIds.has(i.id));
+
+  if (assignedNewInquiries.length) nextSteps.push({ text: `Respond to ${assignedNewInquiries.length} new ${assignedNewInquiries.length === 1 ? 'inquiry' : 'inquiries'}`, link: '/inquiries' });
+  if (notOverduePendingEstimates.length) nextSteps.push({ text: `Follow up on ${notOverduePendingEstimates.length} pending ${notOverduePendingEstimates.length === 1 ? 'estimate' : 'estimates'}`, link: '/work/estimates' });
+  if (overdueEstimateFollowUps.length) nextSteps.push({ text: `Chase ${overdueEstimateFollowUps.length} overdue estimate ${overdueEstimateFollowUps.length === 1 ? 'follow-up' : 'follow-ups'}`, link: '/work/estimates' });
+  if (unassignedInquiries.length) nextSteps.push({ text: `Assign ${unassignedInquiries.length} unassigned ${unassignedInquiries.length === 1 ? 'inquiry' : 'inquiries'}`, link: '/inquiries' });
   if (overdueFollowUps.length) nextSteps.push({ text: `Complete ${overdueFollowUps.length} overdue follow-up${overdueFollowUps.length === 1 ? '' : 's'}`, link: '/work/follow-ups' });
   if (dueTodayFollowUps.length) nextSteps.push({ text: `${dueTodayFollowUps.length} follow-up${dueTodayFollowUps.length === 1 ? '' : 's'} due today`, link: '/work/follow-ups' });
   if (unconfirmedAppts.length) nextSteps.push({ text: `Confirm ${unconfirmedAppts.length} upcoming appointment${unconfirmedAppts.length === 1 ? '' : 's'}`, link: '/work/appointments' });
@@ -707,7 +870,16 @@ router.get('/dashboard', requireAuth, resolveBusiness, (req, res) => {
       activeJobs: activeJobs.length,
       weekInquiries: weekInquiries.length,
       totalCustomers: get('SELECT COUNT(*) AS n FROM customers WHERE business_id = ?', [req.businessId])?.n || 0,
+      // New operational metrics. Each is a database count, not a client-side
+      // derived figure, so the number on screen is the number in the rows.
+      overdueEstimateFollowUps: overdueEstimateFollowUps.length,
+      expiredEstimates: expiredEstimates.length,
+      unassignedInquiries: unassignedInquiries.length,
     },
+    // The underlying rows, so a screen can list them without a second request.
+    overdueEstimateFollowUps,
+    expiredEstimates,
+    unassignedInquiries,
     weekInquiries,
   });
 });

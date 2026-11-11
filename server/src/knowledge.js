@@ -90,7 +90,11 @@ router.get('/', requireAuth, resolveBusiness, (req, res) => {
   );
   if (category) rows = rows.filter((r) => r.category === category);
   if (search) {
-    rows = rows.filter((r) => `${r.title} ${r.content}`.toLowerCase().includes(search));
+    // Normalised multi-term matching: every meaningful term must appear in the
+    // title or the content, in any order, regardless of case or punctuation.
+    // Returns null for an empty query, which means "no filtering".
+    const matches = retrieval.makeKnowledgeMatcher(search);
+    if (matches) rows = rows.filter((r) => matches({ title: r.title, content: r.content }));
   }
 
   const documents = q(
@@ -100,6 +104,18 @@ router.get('/', requireAuth, resolveBusiness, (req, res) => {
     [req.businessId]
   );
 
+  // Annotate each entry so the page can distinguish current / archived /
+  // superseded without recomputing the graph in the browser. `superseded` is
+  // derived from the same helper retrieval uses, so the UI and the assistant can
+  // never disagree about which version is current.
+  const supersededIds = retrieval.supersededItemIds(req.businessId);
+  const supersededBy = retrieval.supersededByMap(req.businessId);
+  rows = rows.map((r) => ({
+    ...r,
+    superseded: supersededIds.has(r.id),
+    superseded_by: supersededBy.get(r.id) ?? null,
+  }));
+
   const counts = {};
   for (const c of CATEGORIES) counts[c] = 0;
   for (const row of q(`SELECT category, COUNT(*) AS n FROM knowledge_items WHERE business_id = ? AND status='active' GROUP BY category`, [req.businessId])) {
@@ -108,6 +124,7 @@ router.get('/', requireAuth, resolveBusiness, (req, res) => {
 
   res.json({
     items: rows,
+    supersededCount: rows.filter((r) => r.superseded).length,
     documents,
     counts,
     categories: CATEGORY_META,
@@ -483,7 +500,17 @@ router.get('/services', requireAuth, resolveBusiness, (req, res) => {
   });
 });
 
-router.post('/services', requireAuth, resolveBusiness, requireRole('owner', 'admin'), async (req, res) => {
+/**
+ * Canonical service-catalog handlers.
+ *
+ * These are the ONLY implementation of service management. The older
+ * `/api/business/services` path in routes.js delegates here rather than keeping a
+ * second, weaker copy: that copy accepted only name+description, so a service
+ * created from Business Settings silently lost its pricing. Two writers over one
+ * table with different validation is how records get quietly degraded, so there
+ * is now one writer.
+ */
+async function createService(req, res) {
   const parsed = z.object({
     name: z.string().min(1, 'Service name is required'),
     description: z.string().optional().default(''),
@@ -503,9 +530,9 @@ router.post('/services', requireAuth, resolveBusiness, requireRole('owner', 'adm
   await reindex(req.businessId, (opts) => retrieval.reindexServiceCatalog(req.businessId, opts));
   logActivity(req.businessId, req.user.id, 'service', Number(info.lastInsertRowid), 'created', d.name);
   res.status(201).json(get('SELECT * FROM business_services WHERE id = ?', [Number(info.lastInsertRowid)]));
-});
+}
 
-router.patch('/services/:id', requireAuth, resolveBusiness, requireRole('owner', 'admin'), async (req, res) => {
+async function updateService(req, res) {
   const existing = get('SELECT * FROM business_services WHERE id = ? AND business_id = ?', [req.params.id, req.businessId]);
   if (!existing) return res.status(404).json({ error: 'Service not found.' });
   const parsed = z.object({
@@ -526,14 +553,22 @@ router.patch('/services/:id', requireAuth, resolveBusiness, requireRole('owner',
   run(`UPDATE business_services SET ${sets.join(', ')} WHERE id = ? AND business_id = ?`, [...params, existing.id, req.businessId]);
   await reindex(req.businessId, (opts) => retrieval.reindexServiceCatalog(req.businessId, opts));
   res.json(get('SELECT * FROM business_services WHERE id = ?', [existing.id]));
-});
+}
 
-router.delete('/services/:id', requireAuth, resolveBusiness, requireRole('owner', 'admin'), async (req, res) => {
+async function deleteService(req, res) {
   run('DELETE FROM business_services WHERE id = ? AND business_id = ?', [req.params.id, req.businessId]);
   await reindex(req.businessId, (opts) => retrieval.reindexServiceCatalog(req.businessId, opts));
   res.json({ ok: true });
-});
+}
+
+const ownerOnly = [requireAuth, resolveBusiness, requireRole('owner', 'admin')];
+router.post('/services', ...ownerOnly, createService);
+router.patch('/services/:id', ...ownerOnly, updateService);
+router.delete('/services/:id', ...ownerOnly, deleteService);
 
 module.exports = router;
+module.exports.createService = createService;
+module.exports.updateService = updateService;
+module.exports.deleteService = deleteService;
 module.exports.parseCsv = parseCsv;
 module.exports.CATEGORIES = CATEGORIES;

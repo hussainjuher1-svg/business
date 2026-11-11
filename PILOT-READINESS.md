@@ -227,6 +227,105 @@ These remain and must be handled before any real deployment:
 
 ---
 
+## 7a. Corrections and follow-up work (reliability pass)
+
+This section records corrections to earlier statements in this report, plus the
+work completed in the follow-up reliability pass. It is appended rather than
+rewritten so the original findings stay auditable.
+
+### Correction: "the knowledge page has no services tab"
+
+An earlier draft of this report listed "Services & pricing management is missing
+from the Knowledge page" as a gap. **That was wrong.** The tab has existed all
+along at `client/src/pages/Knowledge.tsx` (`tabs: items | documents | services |
+setup`). No second tab was created; doing so would have produced two competing
+places to edit the same table.
+
+The real defect underneath it was different and is now fixed.
+
+### Defect 12 (fixed): two service-management paths with different validation
+
+`/api/business/services` and `/api/knowledge/services` both wrote
+`business_services`, but the first accepted only `name` and `description`. A
+service created from Business Settings therefore lost its pricing and was never
+indexed for retrieval, while the same service created from the Services &
+pricing tab kept everything. Two writers over one table with different
+validation is how records degrade quietly.
+
+**Resolution — one canonical path, no records broken:**
+
+- `/api/knowledge/services` is canonical. It is the only implementation.
+- `/api/business/services` still exists and still works, so existing clients do
+  not break, but it now *delegates* to the canonical handlers, gains a `PATCH`,
+  and returns `Deprecation: true` plus a `Link: </api/knowledge/services>;
+  rel="successor-version"` header.
+- The Business Settings screen now calls the canonical path, so nothing new is
+  created through the degraded route.
+- Verified: a service posted to the legacy path keeps `price_min`, `price_max`,
+  `price_note` and `duration_minutes`; both listings return identical ids;
+  existing rows are untouched; `server/test/service-catalog.test.js` covers it.
+
+### Defect 13 (fixed): superseded knowledge could rank first
+
+Retrieval had no notion of supersession in its scoring, so an outdated policy
+could outrank the entry that replaced it and be cited as current fact. The
+scoring formula was not the right place for the fix: a penalty leaves the old
+entry in the evidence list, which is exactly the failure. Superseded items are
+now filtered out of retrieval entirely, in **both** the lexical and vector
+passes, before ranking and slicing.
+
+- The rows, their text, provenance and chunks are all retained, so a policy's
+  history stays auditable.
+- Archiving a replacement does **not** revive the policy it replaced; the
+  superseded set deliberately ignores the superseder's status.
+- Chains resolve correctly: in `A <- B <- C`, only `C` is current.
+- The Knowledge page now distinguishes **Current**, **History** (superseded but
+  active) and **Archived**, and names what replaced the entry.
+- Covered by `server/test/supersession.test.js` (8 tests). Removing the filter
+  fails 7 of them.
+
+### Defect 14 (fixed): knowledge list search was a raw substring match
+
+`haystack.includes(query)` failed on `tune-up` vs `tune up`, on plurals, and on
+any query whose words were not contiguous in the stored text. Replaced with
+normalised multi-term matching: both sides are case-folded, punctuation and
+hyphens are folded to separators, terms are simple-stemmed, and every meaningful
+term must appear in the title or the content. An empty or all-stopword query
+returns everything rather than nothing. Covered by
+`server/test/knowledge-search.test.js` (8 tests); the old implementation fails 3.
+
+### Defect 15 (fixed): no operational attention metrics
+
+Added DB-computed dashboard metrics and attention items:
+
+- **Overdue estimate follow-ups** — pending statuses with a non-null
+  `follow_up_date` strictly before the business-local current date.
+- **Expired estimates** — reported *separately*. An expired quote is not an
+  overdue chase, and conflating them nags about quotes already with the customer.
+- **Unassigned actionable inquiries** — `assigned_to IS NULL` and a status that
+  still needs work.
+
+The same record is never listed twice: overdue estimates are excluded from the
+generic pending-estimate entries, and unassigned inquiries from the generic new-
+inquiry entries. `nextSteps` counts partition the work the same way, so the
+numbers on the Today screen add up instead of double-counting.
+
+`GET /api/inquiries` now supports `assignedTo=none|<staffId>`, composing with
+search, status and pagination; an invalid value is a 400 rather than a silent
+no-op. All comparisons use the business timezone. Covered by
+`server/test/dashboard-attention.test.js` (14 tests).
+
+### Outstanding
+
+- **No model quality evidence.** Unchanged, and the largest gap. Nothing in this
+  pass tests an actual language model; `validate:hvac` and `audit:pilot` both run
+  in `model-offline` mode here.
+- **Not production ready.** See the verdict above.
+- **Communication log** is a design proposal only, not implemented. See
+  `COMMUNICATION-LOG-DESIGN.md`.
+
+---
+
 ## 8. Defects found and fixed during validation
 
 | # | Defect | Severity | Status |

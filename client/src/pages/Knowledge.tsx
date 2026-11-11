@@ -13,6 +13,10 @@ interface Item {
   last_updated: string;
   updated_by_name?: string;
   supersedes_id?: number | null;
+  /** True when a newer entry replaces this one. Such an entry is history, not current fact. */
+  superseded?: boolean;
+  /** The id of the entry that replaced this one, when known. */
+  superseded_by?: number | null;
   chunk_count?: number;
 }
 interface Doc {
@@ -208,16 +212,34 @@ export default function Knowledge() {
 
           <ul className="space-y-2">
             {filtered.map((item) => (
-              <li key={item.id} className={`card p-4 ${item.status === 'archived' ? 'opacity-60' : ''}`}>
+              <li key={item.id} className={`card p-4 ${item.status === 'archived' ? 'opacity-60' : item.superseded ? 'opacity-80' : ''}`}>
                 <div className="flex flex-wrap items-start justify-between gap-2">
                   <div className="min-w-0 flex-1">
                     <div className="flex flex-wrap items-center gap-2">
                       <p className="text-sm font-bold text-ink">{item.title || '(untitled)'}</p>
                       <span className="badge bg-stone-200 text-stone-700">{categories.find((c) => c.id === item.category)?.label || item.category}</span>
-                      {item.status === 'archived' && <span className="badge bg-stone-300 text-stone-700">Archived</span>}
+                      {/* Three distinct states, never merged: an entry can be
+                          active but no longer current because something replaced it. */}
+                      {item.superseded && (
+                        <span className="badge bg-amber-100 text-amber-900" title="A newer entry replaces this one. It is kept for history and is not used by the assistant.">
+                          Superseded{item.superseded_by ? ` by #${item.superseded_by}` : ''}
+                        </span>
+                      )}
+                      {item.status === 'archived' ? (
+                        <span className="badge bg-stone-300 text-stone-700">Archived</span>
+                      ) : item.superseded ? (
+                        <span className="badge bg-stone-200 text-stone-600">History</span>
+                      ) : (
+                        <span className="badge bg-emerald-100 text-emerald-800">Current</span>
+                      )}
                       {item.supersedes_id && <span className="badge bg-indigo-100 text-indigo-900">Replaces #{item.supersedes_id}</span>}
                     </div>
                     <p className="mt-1 line-clamp-3 whitespace-pre-wrap text-sm text-stone-600">{item.content}</p>
+                    {item.superseded && item.status !== 'archived' && (
+                      <p className="mt-1 text-[11px] text-amber-800">
+                        Kept for your records. The assistant answers from the newer entry instead.
+                      </p>
+                    )}
                     <p className="mt-2 text-[11px] text-stone-500">
                       Source: {SOURCE_LABEL[item.source] || item.source}
                       {item.source_detail ? ` · ${item.source_detail}` : ''} · Updated {fmt(item.last_updated)}

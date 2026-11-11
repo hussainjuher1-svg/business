@@ -42,7 +42,10 @@ export default function Settings() {
   async function addService(e: React.FormEvent) {
     e.preventDefault();
     try {
-      await api.post('/business/services', newService);
+      // Canonical service path. The older /business/services route cannot store
+      // pricing, so using it here would create services the Services & pricing
+      // tab shows as unpriced.
+      await api.post('/knowledge/services', newService);
       setNewService({ name: '', description: '' });
       load();
     } catch (err: any) { setError(err.message); }
@@ -118,7 +121,7 @@ export default function Settings() {
           {data.services?.map((s: any) => (
             <li key={s.id} className="flex items-center justify-between rounded-lg bg-stone-50 px-3 py-2">
               <div><p className="text-sm font-semibold text-ink">{s.name}</p>{s.description && <p className="text-xs text-stone-500">{s.description}</p>}</div>
-              <button className="btn-danger" onClick={async () => { await api.del(`/business/services/${s.id}`); load(); }}>Remove</button>
+              <button className="btn-danger" onClick={async () => { await api.del(`/knowledge/services/${s.id}`); load(); }}>Remove</button>
             </li>
           ))}
         </ul>

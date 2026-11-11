@@ -6,7 +6,9 @@
  *  - retrieval is hybrid: FTS5 BM25 + optional local embeddings (cosine);
  *  - the whole database is never sent to the model, only top-k chunks;
  *  - untrusted text is screened for prompt injection at ingest and at read time;
- *  - stale/superseded knowledge is surfaced as a conflict, not silently dropped.
+ *  - superseded knowledge is never cited as current fact, but is never deleted:
+ *    the row and its provenance stay for historical audit and are surfaced as a
+ *    conflict instead.
  */
 
 const { q, get, run } = require('../db');
@@ -303,10 +305,46 @@ function wordSet(text) {
 function tokenize(text) {
   return String(text || '')
     .toLowerCase()
-    .replace(/[^\p{L}\p{N}\s'-]/gu, ' ')
+    // Hyphens and apostrophes are separators, not part of a word, so "tune-up"
+    // and "tune up" produce the same terms. Without this, an owner typing a
+    // hyphen into the search box would have to match the stored hyphen exactly.
+    .replace(/['\u2019-]+/g, ' ')
+    .replace(/[^\p{L}\p{N}\s]/gu, ' ')
     .split(/\s+/)
-    .map((t) => t.replace(/^['-]+|['-]+$/g, ''))
     .filter((t) => t.length > 1 && !STOPWORDS.has(t));
+}
+
+/**
+ * Normalised multi-term matching for the Knowledge list search box.
+ *
+ * The previous implementation was `haystack.includes(query)`, which fails on the
+ * things owners actually type:
+ *   - "heat pump tune-up" missed an entry that says "Heat pump service" because
+ *     the phrase never appears contiguously;
+ *   - "diagnostic fees" missed "diagnostic fee";
+ *   - punctuation inside the query had to be reproduced exactly.
+ *
+ * This matcher normalises both sides (case, hyphens, punctuation, plural/simple
+ * stem), then requires EVERY meaningful query term to appear. Terms may be spread
+ * across the title and the content, which is what a person means by "search".
+ *
+ * Deliberate properties:
+ *   - an empty or all-stopword query returns null, meaning "no filtering", so an
+ *     empty search box shows everything rather than nothing;
+ *   - terms are ANDed, not ORed, so adding a word narrows instead of flooding;
+ *   - it is pure string work: no index, no service, no network.
+ *
+ * @returns {((fields: {title?: string, content?: string}) => boolean)|null}
+ */
+function makeKnowledgeMatcher(rawQuery) {
+  const terms = [...new Set(tokenize(rawQuery).map(stem))].filter(Boolean);
+  if (terms.length === 0) return null;
+
+  return (fields) => {
+    // Normalise exactly the same way as the query so both sides agree.
+    const haystackWords = wordSet(`${fields.title || ''} ${fields.content || ''}`);
+    return terms.every((t) => haystackWords.has(t));
+  };
 }
 
 /**
@@ -321,12 +359,62 @@ function buildFtsQuery(text) {
 }
 
 /**
+ * Supersession: which items are no longer current?
+ *
+ * An item is superseded when any other item in the same business names it in
+ * `supersedes_id`. This deliberately ignores the superseder's own status:
+ * archiving a replacement must NOT silently revive the policy it replaced, which
+ * would quietly serve a retired policy as if it were current.
+ *
+ * Chains need no special handling. In A <- B <- C, both A and B name a live
+ * superseder, so only C is current.
+ *
+ * Nothing is deleted. Superseded rows keep their text, provenance and chunks so
+ * the history of a policy remains auditable.
+ *
+ * @returns {Set<number>} ids of items that must not be cited as current fact
+ */
+function supersededItemIds(businessId) {
+  const rows = q(
+    `SELECT DISTINCT k.id AS id
+       FROM knowledge_items k
+       JOIN knowledge_items s ON s.supersedes_id = k.id
+      WHERE k.business_id = ? AND s.business_id = ?`,
+    [businessId, businessId]
+  );
+  return new Set(rows.map((r) => r.id));
+}
+
+/**
+ * Who superseded each item, for display and for explaining a conflict.
+ * @returns {Map<number, number>} olderId -> newest active superseder id
+ */
+function supersededByMap(businessId) {
+  const rows = q(
+    `SELECT k.id AS older_id, s.id AS newer_id, s.status AS newer_status, s.last_updated
+       FROM knowledge_items k
+       JOIN knowledge_items s ON s.supersedes_id = k.id
+      WHERE k.business_id = ? AND s.business_id = ?
+      ORDER BY (s.status = 'active') DESC, s.last_updated DESC`,
+    [businessId, businessId]
+  );
+  const map = new Map();
+  // The first row per older id wins: active superseders sort before archived ones.
+  for (const r of rows) if (!map.has(r.older_id)) map.set(r.older_id, r.newer_id);
+  return map;
+}
+
+/**
  * Hybrid search over business knowledge for one business.
  * @returns {{hits: Array, usedEmbeddings: boolean, embedError: string|null}}
  */
 async function searchKnowledge({ businessId, query: queryText, limit = 8, embedModel, minScore = 0, intentCategories = null }) {
   const ftsQuery = buildFtsQuery(queryText);
   const scores = new Map(); // chunkId -> { fts, vec, row }
+  // Computed once, applied to both passes below. Filtering at this level means a
+  // superseded policy cannot enter the ranking through *either* the lexical or
+  // the vector route, and therefore cannot reach an evidence-only answer either.
+  const superseded = supersededItemIds(businessId);
 
   // --- lexical pass ---
   if (ftsQuery) {
@@ -436,6 +524,11 @@ async function searchKnowledge({ businessId, query: queryText, limit = 8, embedM
     // Drop anything that shares no stem with the question (unless a very strong
     // semantic match). This is what stopped unrelated policies surfacing.
     .filter((h) => h.coverage > 0 || h.vector >= 0.78)
+    // A superseded item is history, not current fact. It is dropped from evidence
+    // regardless of how well it matches or how high it ranks — that is exactly the
+    // failure this guards against. Archived items never produce chunks, so this
+    // check also covers them.
+    .filter((h) => !(h.sourceType === 'item' && superseded.has(h.sourceId)))
     .filter((h) => h.score >= minScore)
     .sort((a, b) => b.score - a.score)
     .slice(0, limit);
@@ -452,7 +545,14 @@ async function searchKnowledge({ businessId, query: queryText, limit = 8, embedM
  * Fetch a knowledge item / document by id, scoped to the business.
  * Used to enrich sources with recency + provenance for the answer payload.
  */
-function describeSource(businessId, hit) {
+/**
+ * @param {number} businessId
+ * @param {object} hit
+ * @param {{superseded?: Set<number>, supersededBy?: Map<number, number>}} [precomputed]
+ *   Optional. When describing several hits, pass the sets computed once for the
+ *   business so this does not re-query for every source.
+ */
+function describeSource(businessId, hit, precomputed) {
   if (hit.sourceType === 'item') {
     const item = get('SELECT * FROM knowledge_items WHERE id = ? AND business_id = ?', [hit.sourceId, businessId]);
     if (!item) return null;
@@ -466,6 +566,11 @@ function describeSource(businessId, hit) {
       lastUpdated: item.last_updated,
       status: item.status,
       supersedesId: item.supersedes_id,
+      // True when a newer entry replaces this one. Such an item is never cited as
+      // current fact (searchKnowledge filters it out), but the flag is carried so
+      // any surface that lists historical entries can label them honestly.
+      superseded: (precomputed?.superseded ?? supersededItemIds(businessId)).has(item.id),
+      supersededBy: (precomputed?.supersededBy ?? supersededByMap(businessId)).get(item.id) ?? null,
       snippet: sanitizeForPrompt(hit.text, 400),
       flagged: hit.injectionFlag,
       flaggedReason: hit.injectionReason,
@@ -523,6 +628,9 @@ module.exports = {
   searchKnowledge,
   describeSource,
   buildFtsQuery,
+  makeKnowledgeMatcher,
+  supersededItemIds,
+  supersededByMap,
   tokenize,
   stem,
   wordSet,
