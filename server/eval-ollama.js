@@ -30,19 +30,55 @@ const { CASES } = require('./validate-hvac-cases');
 const PORT = 3701;
 
 /**
- * STUB DETECTION — a canned stand-in must never be able to pass as a real model.
+ * STUB PROVENANCE — a canned stand-in must never be able to pass as a real model.
  *
- * server/test/lib/ollama-stub.js answers with a sentence containing "STUB". If
- * any response looks like the stub, the run is marked contaminated: it still
- * produces files (for plumbing checks) but every artefact is labelled, the exit
- * code is non-zero, and `meta.isStubRun` is true, so a stub run can never be
- * filed as validation.
+ * There are two independent signals, and the authoritative one is DECLARED, not
+ * inferred:
+ *
+ *   1. `DAYBOOK_EVAL_STUB=1` — the harness states up front that this run is
+ *      served by a stand-in. This is configuration, so provenance does not
+ *      depend on the contents of a response. It is recorded in the run metadata
+ *      (`meta.stubMode`) and in every record (`responseSource: "stub"`).
+ *   2. A response containing the canned marker — kept as a BACKSTOP, so a stub
+ *      that lies about being declared is still caught. It is never the only
+ *      line of defence.
+ *
+ * If either signal fires, the run is marked contaminated: files are still
+ * written (for plumbing checks) but every artefact is labelled, the exit code is
+ * 5, and `meta.isStubRun` is true.
  */
 const STUB_MARKER = /STUB (ANSWER|RESPONSE)|not a real model response/i;
-const stubHits = new Set();
+
+/**
+ * Records what was observed, kept deliberately separate:
+ *
+ *   markerHits   — responses whose TEXT matched the canned marker. This is the
+ *                  backstop signal, and it must never be inflated by declared
+ *                  mode, otherwise "was a marker seen?" becomes unanswerable.
+ *   stubRecords  — every record classified as stub output, however decided.
+ */
+const markerHits = new Set();
+const stubRecords = new Set();
+
+function noteStub(id, text) {
+  stubRecords.add(String(id));
+  if (looksLikeStub(text)) markerHits.add(String(id));
+}
+
+/** Declared stub mode: set by the test harness, never by normal use. */
+const STUB_MODE_DECLARED = /^(1|true|yes)$/i.test(String(process.env.DAYBOOK_EVAL_STUB || '').trim());
 
 function looksLikeStub(text) {
   return STUB_MARKER.test(String(text || ''));
+}
+
+/**
+ * Provenance of one response. Declared stub mode wins outright: when the harness
+ * says a stand-in is serving, no response can be a model answer even if it looks
+ * like one.
+ */
+function isStubResponse(text) {
+  return STUB_MODE_DECLARED || looksLikeStub(text);
 }
 const ROOT = path.join(__dirname, '..');
 // Results are git-ignored. DAYBOOK_EVAL_DIR lets a plumbing test write somewhere
@@ -78,25 +114,29 @@ function keywordSignals(c, res) {
 }
 
 /**
- * OUTCOME TAXONOMY — four mutually exclusive, exhaustively checkable buckets.
+ * OUTCOME TAXONOMY — five mutually exclusive, exhaustively checkable buckets.
  *
- * The distinction that matters most is between a *refusal* (a correct product
- * decision: some questions must never reach the model) and a *technical
- * failure* (the model should have answered and did not). Conflating them would
- * let a dead Ollama look like a healthy run, or a healthy run look broken.
+ * Order matters. Provenance is decided BEFORE anything else, because the most
+ * damaging mistake this runner could make is attributing canned test text to a
+ * real model.
  *
- *   model-answer        Ollama generated the text. Only this bucket counts as
- *                       model validation.
+ *   stub-output         The reply came from the test stand-in, not a model.
+ *                       Never counted as a model answer, never given a model
+ *                       identifier. Any run containing this is contaminated.
+ *   technical-failure   HTTP error, no mode, or Ollama was needed and failed
+ *                       (model-offline / model-error / ai-disabled).
  *   refusal-by-design   The right outcome is a refusal (out-of-scope / refused).
- *                       These questions are correct WITH or WITHOUT Ollama.
- *   technical-failure   Ollama was needed and did not deliver:
- *                       model-offline / model-error / ai-disabled.
+ *                       Correct WITH or WITHOUT Ollama.
  *   inconclusive        Daybook found no evidence to answer from
- *                       (no-evidence / builtin-guide). Not a model verdict.
+ *                       (no-evidence / builtin-guide).
+ *   model-answer        Ollama generated the text. The ONLY bucket that counts
+ *                       as model validation — and only when the response also
+ *                       reports a model identifier.
  *
- * `local-model` is the ONLY mode in which the assistant returns model text.
+ * `local-model` is the only mode in which the assistant returns model text.
  */
 const MODEL_MODE = 'local-model';
+const STUB_OUTCOME = 'stub-output';
 
 const OUTCOME_BY_MODE = {
   'local-model': 'model-answer',
@@ -109,22 +149,49 @@ const OUTCOME_BY_MODE = {
   'builtin-guide': 'inconclusive',
 };
 
-const OUTCOMES = ['model-answer', 'refusal-by-design', 'technical-failure', 'inconclusive'];
+const OUTCOMES = [STUB_OUTCOME, 'technical-failure', 'refusal-by-design', 'inconclusive', 'model-answer'];
 
 /**
  * @param {object} res assistant response body
  * @param {number} httpStatus HTTP status of the request that produced it
  */
 function classifyOutcome(res, httpStatus) {
-  const mode = String(res?.mode || '');
-  // A transport/HTTP failure or an unhandled exception is always technical,
-  // whatever the body claims.
+  const answer = String(res?.answer || '');
+
+  // 1. The canned marker is definitive evidence of the stand-in, so it is
+  //    checked before anything else and wins outright.
+  if (looksLikeStub(answer)) return STUB_OUTCOME;
+
+  // 2. Transport/HTTP failure is always technical, whatever the body claims.
   if (httpStatus && httpStatus >= 400) return 'technical-failure';
+
+  const mode = String(res?.mode || '');
   if (!mode) return 'technical-failure';
-  return OUTCOME_BY_MODE[mode] || 'technical-failure';
+  const outcome = OUTCOME_BY_MODE[mode] || 'technical-failure';
+
+  // 3. Provenance, for the only outcome a model can produce. Declared stub mode
+  //    means the harness told us a stand-in is serving, so text that would
+  //    otherwise be a model answer is stub output — recorded as such even when
+  //    it carries no marker. Refusals and no-evidence outcomes are reached
+  //    without ever calling a model, so they keep their own honest
+  //    classification; calling them "stub" would be a different lie.
+  if (outcome === 'model-answer') {
+    if (STUB_MODE_DECLARED) return STUB_OUTCOME;
+    // A model answer must also identify the model that produced it. Without a
+    // reported identifier we cannot attribute the answer, so it is not
+    // validation.
+    if (!hasReportedModel(res)) return 'technical-failure';
+  }
+
+  return outcome;
 }
 
-/** True only for text Ollama actually generated. */
+/** Did the response actually report which model produced it? */
+function hasReportedModel(res) {
+  return typeof res?.model === 'string' && res.model.trim().length > 0;
+}
+
+/** True only for text Ollama actually generated and identified. */
 function producedByModel(res, httpStatus) {
   return classifyOutcome(res, httpStatus) === 'model-answer';
 }
@@ -165,9 +232,11 @@ function writeReviewPack({ runDir, meta, records, setupRecords = [] }) {
   // ---- human checklist ----
   const lines = [];
   if (meta.isStubRun) {
-    lines.push('# ⚠ STUB RUN — NOT A MODEL EVALUATION');
+    lines.push('# STUB — NOT MODEL VALIDATION');
     lines.push('');
     lines.push('> This output was produced by the **canned test stub**, not by a model.');
+    lines.push(`> Provenance: declared stub mode = \`${meta.stubMode || 'unknown'}\`; canned marker detected = ${meta.stubMarkerDetected ? 'yes' : 'no'}.`);
+    if (meta.stubDeclaration) lines.push(`> ${meta.stubDeclaration}`);
     lines.push(`> Marked questions: ${(meta.stubQuestions || []).join(', ')}`);
     lines.push('> It exercises plumbing only. Do not report anything here as validation.');
     lines.push('');
@@ -200,6 +269,20 @@ function writeReviewPack({ runDir, meta, records, setupRecords = [] }) {
   lines.push(`| Setup turns (not counted as questions) | ${meta.setupTurns} |`);
   lines.push(`| Independent conversations | ${meta.conversations.distinctConversationIds} distinct / ${meta.conversations.questions} questions |`);
   lines.push(`| Stub detected | ${meta.isStubRun ? 'YES — not validation' : 'no'} |`);
+  lines.push(`| Stub mode | ${meta.stubMode || 'not-declared'} |`);
+  const ix = meta.indexing || {};
+  lines.push(`| Indexing | ${ix.chunks ?? '?'} chunks, ${ix.embedded ?? '?'} embedded (HTTP ${ix.reindexHttpStatus ?? '?'}) |`);
+  lines.push(`| Embedding model at indexing | ${ix.configuredEmbedModel || '?'} |`);
+  lines.push(`| Embeddings used per answer | ${meta.embeddingUsage?.answersUsingEmbeddings ?? 0} / ${records.length} |`);
+  if (meta.embeddingUsage && !meta.embeddingUsage.fullyEmbedded) {
+    lines.push('');
+    lines.push(`> **WARNING:** ${meta.embeddingUsage.answersNotUsingEmbeddings} answer(s) were retrieved with`);
+    lines.push('> full-text ranking only, not embeddings. Those questions do not reflect the intended');
+    lines.push('> retrieval configuration.');
+  }
+  if (meta.conversations?.followUpQuestionId) {
+    lines.push(`| Follow-up Q${meta.conversations.followUpQuestionId} continued its setup conversation | ${meta.conversations.followUpContinuesSetupTurn ? 'YES (enforced)' : 'NO'} |`);
+  }
   lines.push('');
   if (meta.tally['technical-failure'] > 0) {
     lines.push(`> **WARNING:** ${meta.tally['technical-failure']} question(s) hit a technical failure — the`);
@@ -220,7 +303,8 @@ function writeReviewPack({ runDir, meta, records, setupRecords = [] }) {
     lines.push('');
     lines.push(`- **Group:** ${r.group}`);
     lines.push(`- **Outcome:** \`${r.outcome}\` · **Mode:** \`${r.mode}\` · **Model:** ${r.model ? `\`${r.model}\`` : 'n/a (not a model answer)'} · **Latency:** ${r.latencyMs} ms`);
-    lines.push(`- **Retrieval:** ${r.sources.length} source(s), embeddings ${r.retrieval?.usedEmbeddings ? 'used' : 'not used'}, keyword conditions ${r.retrieval?.passesKeywordConditions ? 'met' : 'NOT met'}`);
+    lines.push(`- **Retrieval:** ${r.sources.length} source(s), embeddings ${r.retrieval?.usedEmbeddings ? 'used' : '**NOT USED (full-text only)**'}, keyword conditions ${r.retrieval?.passesKeywordConditions ? 'met' : 'NOT met'}`);
+    if (r.responseSource) lines.push(`- **Response source:** \`${r.responseSource}\`${r.outcome === 'stub-output' ? ' — **STUB, NOT A MODEL**' : ''}`);
     if (r.retrieval?.missingExpected?.length) lines.push(`- **Missing expected fact:** ${r.retrieval.missingExpected.join(', ')}`);
     if (r.retrieval?.containsForbidden?.length) lines.push(`- **Contains forbidden content:** ${r.retrieval.containsForbidden.join(', ')}`);
     lines.push('');
@@ -258,6 +342,36 @@ function writeReviewPack({ runDir, meta, records, setupRecords = [] }) {
     lines.push('');
     lines.push('---');
     lines.push('');
+  }
+
+  // ---- Setup turns (context for the follow-up question) ----
+  if (Array.isArray(setupRecords) && setupRecords.length) {
+    lines.push('## Setup turns (context, not scored)');
+    lines.push('');
+    lines.push('These are not questions. They exist only to give the follow-up question a');
+    lines.push('conversation to continue, and are shown so you can verify the context it saw.');
+    lines.push('');
+    for (const st of setupRecords) {
+      lines.push(`### Setup for Q${st.forQuestion}`);
+      lines.push('');
+      lines.push(`- **Conversation:** \`${st.conversationId}\``);
+      lines.push(`- **Outcome:** \`${st.outcome}\` · **Model:** ${st.model ? `\`${st.model}\`` : 'n/a'} · **Latency:** ${st.latencyMs} ms`);
+      lines.push('');
+      lines.push('**Prompt sent**');
+      lines.push('');
+      lines.push('```text');
+      lines.push(String(st.question || ''));
+      lines.push('```');
+      lines.push('');
+      lines.push('**Response received**');
+      lines.push('');
+      lines.push('```text');
+      lines.push(String(st.answer || '').slice(0, 3000));
+      lines.push('```');
+      lines.push('');
+      lines.push('---');
+      lines.push('');
+    }
   }
 
   lines.push(...checklistSection());
@@ -400,12 +514,78 @@ async function main() {
     if (login.status !== 200) throw new Error(`login failed: ${JSON.stringify(login.data)}`);
 
     // Real embeddings, so retrieval is measured as it will actually run.
+    // ---- 2b. Index with the local embedding model, and FAIL CLOSED ----
+    //
+    // Without embeddings, retrieval falls back to full-text ranking. That is a
+    // different configuration from the one intended, so a run that silently
+    // proceeded without embeddings would be mislabelled. Any failure here stops
+    // the run instead of producing a report that looks complete.
     console.log('\nIndexing the HVAC knowledge base with the local embedding model…');
     const reindex = await call('POST', '/api/knowledge/reindex-all', {});
-    console.log(`reindex-all -> HTTP ${reindex.status} ${JSON.stringify(reindex.data).slice(0, 300)}`);
+    const reindexBody = reindex.data || {};
+    const reindexOk =
+      reindex.status === 200 &&
+      reindexBody.ok === true &&
+      !reindexBody.embedError &&
+      Number(reindexBody.embedded) > 0;
 
+    console.log(`reindex-all -> HTTP ${reindex.status} ${JSON.stringify(reindexBody).slice(0, 300)}`);
+
+    if (!reindexOk) {
+      const why =
+        reindex.status !== 200
+          ? `HTTP ${reindex.status}`
+          : reindexBody.ok !== true
+            ? 'the response did not report ok:true'
+            : reindexBody.embedError
+              ? `embedding error: ${reindexBody.embedError}`
+              : `0 chunks were embedded (embedded=${reindexBody.embedded})`;
+      throw new Error(
+        `Indexing with the embedding model failed: ${why}. ` +
+        'Refusing to run: without embeddings the retrieval configuration under test is not the one ' +
+        'that ships, so any results would be mislabelled.'
+      );
+    }
+
+    // Re-read the model status AFTER indexing: the point is to prove the
+    // embedding model is loaded and usable at the time the questions are asked.
     const modelStatus = await call('GET', '/api/assistant/status');
-    console.log(`Assistant status -> chatModelReady=${modelStatus.data?.model?.chatModelReady} embedModelReady=${modelStatus.data?.model?.embedModelReady}`);
+    const ms = modelStatus.data || {};
+    console.log(
+      `Assistant status -> chatModelReady=${ms.model?.chatModelReady} embedModelReady=${ms.model?.embedModelReady} ` +
+      `problem=${ms.model?.problem || 'none'}`
+    );
+
+    if (ms.model?.embedModelReady !== true) {
+      throw new Error(
+        'The embedding model is not ready according to the assistant status immediately after indexing. ' +
+        `Reported problem: ${ms.model?.problem || 'unknown'}. Refusing to run.`
+      );
+    }
+    if (ms.model?.chatModelReady !== true) {
+      throw new Error(
+        'The chat model is not ready according to the assistant status. ' +
+        `Reported problem: ${ms.model?.problem || 'unknown'}. Refusing to run.`
+      );
+    }
+
+    const indexing = {
+      reindexHttpStatus: reindex.status,
+      chunks: reindexBody.chunks ?? null,
+      embedded: reindexBody.embedded ?? null,
+      embedError: reindexBody.embedError ?? null,
+      // Identity actually reported by the embedding model, if the endpoint
+      // surfaced it; otherwise the configured value with a flag.
+      configuredEmbedModel: status.embedModel,
+      embedModelReadyAfterIndexing: ms.model?.embedModelReady === true,
+      chatModelReadyAfterIndexing: ms.model?.chatModelReady === true,
+      assistantReportedEmbedModel: ms.model?.embedModel || null,
+      assistantReportedChatModel: ms.model?.chatModel || null,
+      embeddingsIndexed: true,
+    };
+    console.log(
+      `Indexed ${indexing.embedded}/${indexing.chunks} chunks with "${indexing.configuredEmbedModel}"`
+    );
 
     const meta = {
       runId: stamp,
@@ -423,9 +603,10 @@ async function main() {
         'Node version': process.version,
         'Platform': `${process.platform} ${process.arch}`,
       },
+      indexing,
       // Question-level totals. These MUST reconcile to CASES.length.
       totalQuestions: CASES.length,
-      counts: { 'model-answer': 0, 'refusal-by-design': 0, 'technical-failure': 0, inconclusive: 0 },
+      counts: { 'model-answer': 0, 'refusal-by-design': 0, 'technical-failure': 0, inconclusive: 0, 'stub-output': 0 },
       // Setup turns are not questions and never count towards the 30.
       setupTurns: 0,
       setupTurnOutcomes: {},
@@ -460,20 +641,48 @@ async function main() {
         const seed = await call('POST', '/api/assistant/chat', { message: c.followUpTo });
         const seedElapsed = Date.now() - seedStart;
         conversationId = seed.data?.conversationId || null;
+
+        // The setup turn obeys exactly the same provenance rules as a scored
+        // question: stub text is never attributed to a model.
         const seedOutcome = classifyOutcome(seed.data, seed.status);
+        const seedIsModel = seedOutcome === 'model-answer';
+        const seedModelId = seedIsModel ? String(seed.data.model).trim() : '';
+
         meta.setupTurns++;
         meta.setupTurnOutcomes[seedOutcome] = (meta.setupTurnOutcomes[seedOutcome] || 0) + 1;
+        if (seedOutcome === STUB_OUTCOME) noteStub(`${c.id}-setup`, seed.data?.answer);
+
+        if (!conversationId) {
+          throw new Error(
+            `Follow-up setup turn for question ${c.id} returned no conversation id. ` +
+            'The follow-up cannot be verified as continuing the same conversation.'
+          );
+        }
+
         setupRecords.push({
           kind: 'setup-turn',
           forQuestion: c.id,
-          conversationId: seed.data?.conversationId ?? null,
+          conversationId,
           group: c.group,
+          // Full prompt and response are kept so the review pack can show the
+          // context the follow-up answer was given.
           question: c.followUpTo,
           httpStatus: seed.status,
           answer: seed.data?.answer || '',
           mode: seed.data?.mode || 'error',
           outcome: seedOutcome,
-          model: seed.data?.model || '',
+          producedByModel: seedIsModel,
+          model: seedModelId,
+          modelSource: seedIsModel
+            ? 'reported-by-ollama'
+            : seedOutcome === STUB_OUTCOME
+              ? 'stub-stand-in'
+              : 'not-applicable',
+          responseSource: seedOutcome === STUB_OUTCOME
+            ? 'stub'
+            : seedIsModel
+              ? 'local-ollama'
+              : 'daybook-deterministic',
           latencyMs: seed.data?.latencyMs ?? seedElapsed,
           sources: seed.data?.sources || [],
           note: 'Setup turn providing context for the follow-up question. Not scored.',
@@ -491,12 +700,13 @@ async function main() {
       const signals = keywordSignals(c, data);
       const outcome = classifyOutcome(data, res.status);
       meta.counts[outcome]++;
-      if (looksLikeStub(data.answer)) stubHits.add(c.id);
+      if (outcome === STUB_OUTCOME) noteStub(c.id, data.answer);
 
-      // Only a model-answer carries a meaningful model identifier. Anything
-      // else is deterministic text and must not be attributed to the model.
+      // Only a model-answer carries a model identifier, and only the one the
+      // model actually reported. Deterministic text — including stub output —
+      // must never be attributed to a model.
       const isModel = outcome === 'model-answer';
-      const modelId = isModel ? (data.model || status.chatModel) : '';
+      const modelId = isModel ? String(data.model).trim() : '';
 
       const record = {
         kind: 'question',
@@ -510,7 +720,17 @@ async function main() {
         httpStatus: res.status,
         // Recorded only when Ollama actually produced this answer.
         model: modelId,
-        modelSource: isModel ? 'reported-by-ollama' : 'not-applicable',
+        modelSource: isModel
+          ? 'reported-by-ollama'
+          : outcome === STUB_OUTCOME
+            ? 'stub-stand-in'
+            : 'not-applicable',
+        // Where the text came from, independent of the product's `mode` field.
+        responseSource: outcome === STUB_OUTCOME
+          ? 'stub'
+          : isModel
+            ? 'local-ollama'
+            : 'daybook-deterministic',
         requestedModel: status.chatModel,
         mode: data.mode || 'error',
         outcome,
@@ -550,15 +770,37 @@ async function main() {
     const independent = records.filter((r) => !followUpCase || r.id !== followUpCase.id);
     const convIds = independent.map((r) => r.conversationId).filter(Boolean);
     const distinctConvs = new Set(convIds).size;
+    // The follow-up must provably continue its setup turn's conversation.
+    let followUpOk = null;
+    if (followUpCase) {
+      const qRec = records.find((r) => r.id === followUpCase.id);
+      const sRec = setupRecords.find((r) => r.forQuestion === followUpCase.id);
+      if (!qRec || !sRec) {
+        throw new Error(`Follow-up assertion failed: missing record for question ${followUpCase.id}.`);
+      }
+      if (!qRec.conversationId || !sRec.conversationId) {
+        throw new Error(
+          `Follow-up assertion failed: question ${followUpCase.id} or its setup turn has no conversation id ` +
+          `(question=${qRec.conversationId}, setup=${sRec.conversationId}).`
+        );
+      }
+      followUpOk = qRec.conversationId === sRec.conversationId;
+      if (!followUpOk) {
+        throw new Error(
+          `Follow-up assertion failed: question ${followUpCase.id} used conversation ${qRec.conversationId} ` +
+          `but its setup turn used ${sRec.conversationId}. The follow-up was not asked in context.`
+        );
+      }
+    }
+
     meta.conversations = {
       questions: records.length,
       distinctConversationIds: distinctConvs,
       questionsSharingAConversation: convIds.length - distinctConvs,
       independent: distinctConvs === convIds.length && convIds.length === independent.length,
-      followUpContinuesSetupTurn: followUpCase
-        ? records.find((r) => r.id === followUpCase.id)?.conversationId
-          === setupRecords.find((r) => r.forQuestion === followUpCase.id)?.conversationId
-        : null,
+      followUpQuestionId: followUpCase ? followUpCase.id : null,
+      followUpContinuesSetupTurn: followUpOk,
+      followUpEnforced: true,
     };
     if (!meta.conversations.independent) {
       throw new Error(
@@ -580,8 +822,45 @@ async function main() {
       );
     }
     meta.modelsUsed = [...meta.modelsUsed];
-    meta.isStubRun = stubHits.size > 0;
-    meta.stubQuestions = [...stubHits];
+
+    // ---- Stub provenance, decided explicitly ----
+    // Two independent signals, each recorded on its own terms:
+    //   declared — the harness said up front that a stand-in is serving
+    //   marker   — a response's text matched the canned marker (backstop only)
+    meta.stubMode = STUB_MODE_DECLARED ? 'declared' : 'not-declared';
+    meta.stubMarkerDetected = markerHits.size > 0;
+    meta.stubMarkerRecords = [...markerHits];
+    meta.stubQuestions = [...stubRecords];
+    meta.isStubRun = STUB_MODE_DECLARED || markerHits.size > 0;
+    if (STUB_MODE_DECLARED) {
+      meta.stubDeclaration = 'DAYBOOK_EVAL_STUB=1 — responses served by the test stand-in, not a model';
+    }
+
+    // ---- Embedding usage per answer ----
+    // Retrieval can fall back to full text per request, so this is measured
+    // per answer rather than assumed from the indexing step.
+    const embeddingUsage = records.map((r) => ({
+      id: r.id,
+      usedEmbeddings: r.retrieval?.usedEmbeddings === true,
+      knowledgeChunks: r.retrieval?.knowledgeChunks ?? null,
+    }));
+    const embeddedCount = embeddingUsage.filter((e) => e.usedEmbeddings).length;
+    meta.embeddingUsage = {
+      perAnswer: embeddingUsage,
+      answersUsingEmbeddings: embeddedCount,
+      answersNotUsingEmbeddings: embeddingUsage.length - embeddedCount,
+      // True only when the whole run actually used the intended configuration.
+      fullyEmbedded: embeddedCount === embeddingUsage.length,
+      configuredModel: status.embedModel,
+      indexedChunksEmbedded: indexing.embedded,
+    };
+    if (!meta.embeddingUsage.fullyEmbedded) {
+      console.warn(
+        `\nWARNING: ${meta.embeddingUsage.answersNotUsingEmbeddings} answer(s) did not use embeddings. ` +
+        'Those questions were retrieved with full-text ranking only, which is NOT the intended ' +
+        'configuration. They are marked in the review pack.'
+      );
+    }
 
     meta.finishedAt = new Date().toISOString();
     writeReviewPack({ runDir, meta, records, setupRecords });
@@ -599,7 +878,8 @@ async function main() {
     console.log(`Independent conversations       : ${meta.conversations.distinctConversationIds} distinct for ${independent.length} independent questions (follow-up reuses its setup turn: ${meta.conversations.followUpContinuesSetupTurn})`);
     console.log('');
     console.log('OUTCOME BREAKDOWN');
-    console.log(`  model-answer          ${String(tally['model-answer']).padStart(3)}  Ollama generated the text`);
+    console.log(`  model-answer          ${String(tally['model-answer']).padStart(3)}  Ollama generated the text AND reported its identity`);
+    console.log(`  stub-output           ${String(tally[STUB_OUTCOME]).padStart(3)}  canned test text — NOT a model answer`);
     console.log(`  refusal-by-design     ${String(tally['refusal-by-design']).padStart(3)}  correct refusal, model not needed`);
     console.log(`  technical-failure     ${String(tally['technical-failure']).padStart(3)}  model should have answered but did not`);
     console.log(`  inconclusive          ${String(tally.inconclusive).padStart(3)}  no evidence found to answer from`);
@@ -607,6 +887,11 @@ async function main() {
     console.log(`  TOTAL                 ${String(records.length).padStart(3)}  reconciles to ${meta.totalQuestions}: ${meta.reconciled ? 'YES' : 'NO'}`);
     console.log('');
     console.log(`Model identifier(s) reported    : ${meta.modelsUsed.join(', ') || '(none — no model answer)'}`);
+    console.log(`Embeddings used per answer      : ${meta.embeddingUsage.answersUsingEmbeddings} / ${records.length}` +
+      (meta.embeddingUsage.fullyEmbedded ? '' : '  ← PARTIAL: not the intended retrieval configuration'));
+    if (meta.conversations.followUpQuestionId) {
+      console.log(`Follow-up Q${meta.conversations.followUpQuestionId} continued its setup conversation : ${meta.conversations.followUpContinuesSetupTurn ? 'YES' : 'NO'}`);
+    }
     console.log(`Latency (model answers)         : p50 ${p50} ms, p95 ${p95} ms, max ${latencies.at(-1) || 0} ms`);
     console.log(`Keyword conditions met          : ${modelRecords.filter((r) => r.retrieval?.passesKeywordConditions).length} / ${modelRecords.length} of model answers (necessary condition only)`);
     console.log(`Model answers using embeddings  : ${modelRecords.filter((r) => r.retrieval?.usedEmbeddings).length} / ${modelRecords.length}`);
@@ -618,14 +903,19 @@ async function main() {
 
     if (meta.isStubRun) {
       console.error('\n' + '!'.repeat(78));
-      console.error('STUB DETECTED — THIS RUN IS NOT MODEL VALIDATION.');
-      console.error(`${stubHits.size} answer(s) match the canned stub marker: ${[...stubHits].join(', ')}`);
-      console.error('The stub is test plumbing only. Delete these results and re-run against real Ollama.');
+      console.error('STUB — NOT MODEL VALIDATION');
+      console.error('!'.repeat(78));
+      console.error(`Provenance: stub mode ${meta.stubMode}; canned marker detected: ${meta.stubMarkerDetected ? 'yes' : 'no'}`);
+      console.error(`${tally[STUB_OUTCOME]} response(s) came from the canned test stand-in, not a model.`);
+      console.error(`Model answers in this run: ${tally['model-answer']}`);
+      console.error(`Affected: ${[...stubRecords].join(', ')}`);
+      console.error('');
+      console.error('Stub responses are classified as stub-output: they are never counted as');
+      console.error('model answers and never attributed to Ollama. This output must not be');
+      console.error('reported as validation. Delete it and re-run against real Ollama.');
       console.error('!'.repeat(78));
       exitCode = 5;
-    }
-
-    if (tally['model-answer'] === 0) {
+    } else if (tally['model-answer'] === 0) {
       console.error('\nNO ANSWER WAS PRODUCED BY THE MODEL. This run is not model validation.');
       exitCode = 3;
     } else if (tally['technical-failure'] > 0) {

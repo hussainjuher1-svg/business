@@ -132,9 +132,24 @@ Notes:
   does not matter which folder you start npm from.
 - **Never commit `.env`.** It is already git-ignored.
 
-> `.env` is read by Node itself (`--env-file-if-exists=.env` in the `start` and
-> `dev:server` scripts). No `dotenv` package is involved, and no extra config
-> step exists.
+> **Every script reads this same `.env`.** The app (`start`, `dev:server`) and the
+> evaluation tooling (`check:ollama`, `eval:ollama`, `dataset:hvac`) all run with
+> `node --env-file-if-exists=.env`, so Node loads the file itself — no `dotenv`
+> package, no extra config step. A preflight therefore cannot pass against a
+> different endpoint or model than the one Daybook will actually use.
+>
+> Because the whole file is shared, changing `OLLAMA_CHAT_MODEL` or
+> `OLLAMA_BASE_URL` changes it for the checker, the runner and the app at once.
+> That is deliberate: there is one configuration.
+>
+> The checker prints the values it resolved before testing anything:
+>
+> ```
+> Effective configuration (from .env, same as the running app):
+>   OLLAMA_BASE_URL   = http://127.0.0.1:11434
+>   OLLAMA_CHAT_MODEL = llama3.2:3b
+>   OLLAMA_EMBED_MODEL= nomic-embed-text
+> ```
 
 ### Environment-variable syntax (PowerShell vs CMD)
 
@@ -199,24 +214,99 @@ To recreate it later, delete the file yourself first:
 Remove-Item data\hvac-eval.db*
 ```
 
-### Start Daybook
+---
 
-Two options:
+## 3. Two different things you can test — pick the one you want
 
-**Option A — production-style single server (recommended for evaluation)**
+> **Read this before starting a server.** Manual clicking and the automated
+> evaluation use **different databases** and **different servers**. Confusing them
+> is the most common way to "test" the wrong data.
+
+| | **(A) Manual UI testing** | **(B) Automated evaluation** |
+|---|---|---|
+| What you do | Click around Daybook yourself | `npm run eval:ollama` |
+| Database | `data\hvac-eval.db` (persistent, the one you created above) | The runner's **own temporary DB**, created and deleted automatically |
+| Server | **You** start it — `npm start` / `npm run dev` | The runner starts its own; **do not** start Daybook |
+| Questions | Whatever you type | The fixed 30-question bank |
+| Output | What you see on screen | `eval-results\<timestamp>\` + `REVIEW.md` |
+
+### (A) Manual UI testing against the HVAC database
+
+Point `DB_PATH` at the HVAC file for **that shell only**, then start Daybook.
+Never point it at `data\daybook.db` — see the warning below.
+
+**PowerShell**
 
 ```powershell
-npm run build                    # builds the React client into client\dist
-npm start                        # serves API + UI on http://127.0.0.1:3001
+$env:DB_PATH = ".\data\hvac-eval.db"
+npm run build
+npm start                     # http://127.0.0.1:3001
 ```
 
-**Option B — dev mode with hot reload**
+Or in one line, so the variable cannot outlive the command:
 
 ```powershell
-npm run dev                      # API on :3001, Vite UI on http://127.0.0.1:5173
+$env:DB_PATH = ".\data\hvac-eval.db"; npm start
 ```
 
-Open <http://127.0.0.1:3001> (Option A) or <http://127.0.0.1:5173> (Option B).
+**dev mode (hot reload) instead of `npm start`**
+
+```powershell
+$env:DB_PATH = ".\data\hvac-eval.db"
+npm run dev                   # API :3001, UI http://127.0.0.1:5173
+```
+
+**CMD**
+
+```bat
+set DB_PATH=.\data\hvac-eval.db
+npm start
+```
+
+**Git Bash**
+
+```bash
+DB_PATH=./data/hvac-eval.db npm start
+```
+
+To go back to your normal development data, **open a new shell** (the variable
+only lives in the window you set it in). If you used `setx`/`SetEnvironmentVariable`
+persistently instead, clear it explicitly.
+
+Verify you are really on the HVAC file — `db` must end in `hvac-eval.db`:
+
+```powershell
+curl.exe http://127.0.0.1:3001/health
+```
+
+```json
+{"ok":true,"service":"daybook-api","db":"C:\\dev\\business\\data\\hvac-eval.db"}
+```
+
+> ### Never test against `data\daybook.db`
+> That is your **real development database**. Running the HVAC questions against
+> it proves nothing (Northwind Heating & Air does not exist in it) and any
+> evaluation state you create lands in your working data. Every instruction in
+> this document targets `data\hvac-eval.db` or a throwaway temp DB — if you find
+> yourself setting `DB_PATH` to `daybook.db`, stop.
+
+### (B) Automated evaluation — do not start a server first
+
+`npm run eval:ollama` **starts its own server process against its own temporary
+database**, then shuts both down. Starting `npm start` or `npm run dev` before it
+is unnecessary, and a second server on port 3001 only causes `EADDRINUSE`.
+
+It never opens `data\daybook.db` and never opens `data\hvac-eval.db` either.
+There is nothing to configure and nothing to clean up.
+
+> The dev database is protected: the runner would rather fail loudly than write to
+> it. Do not "prepare" it, reseed it, or restore it to make a run work.
+
+### If you only want to look at the app (no Ollama)
+
+`npm run dev` with no `DB_PATH` uses `data\daybook.db` — that is the normal
+development setup and is fine for functional clicking. It is **not** a valid
+subject for the HVAC evaluation.
 
 > The Vite dev server binds to **`127.0.0.1` only** and proxies `/api` and
 > `/health` to the local backend (`DAYBOOK_API_TARGET`, default
@@ -243,7 +333,7 @@ is still configured against Arena's environment — check `.env`.
 
 ---
 
-## 3. Preflight: is Ollama actually wired up?
+## 4. Preflight: is Ollama actually wired up?
 
 ```powershell
 npm run check:ollama
@@ -265,7 +355,7 @@ offline and answer from retrieved evidence only.
 
 ---
 
-## 4. Run the real-model evaluation
+## 5. Run the real-model evaluation
 
 ```powershell
 npm run eval:ollama
@@ -279,13 +369,20 @@ What it does:
 
 1. Refuses to start unless Ollama is reachable **and both models are ready**.
 2. Re-indexes the HVAC knowledge base with `nomic-embed-text` so retrieval is
-   measured with embeddings enabled.
-3. Asks all 30 questions — **each in its own conversation**, so one answer cannot
+   measured with embeddings enabled. **This step fails closed:** if the reindex
+   call does not return HTTP 200 with `ok: true`, no embedding errors and a
+   non-zero embedded count, the run aborts instead of producing a report.
+3. Re-checks `/api/assistant/status` after indexing and aborts unless the
+   embedding model **and** chat model are both reported ready.
+4. Asks all 30 questions — **each in its own conversation**, so one answer cannot
    leak context into the next. Only the deliberate follow-up case (Q30) carries a
-   conversation forward, because that is the behaviour under test.
-4. Records, per question: the full answer, the model identifier Ollama reported,
-   source evidence and citations, gains/gaps, the mode, and response time.
-5. Writes three files to `eval-results\<timestamp>\`.
+   conversation forward, because that is the behaviour under test. That reuse is
+   an **assertion**: if the follow-up does not come back on its setup turn's
+   conversation id, the run aborts.
+5. Records, per question: the full answer, the model identifier Ollama actually
+   reported, the response source, source evidence and citations, gains/gaps, the
+   mode, whether embeddings were used for that answer, and response time.
+6. Writes three files to `eval-results\<timestamp>\`.
 
 ### Expected output
 
@@ -296,7 +393,8 @@ Setup turns (not questions)     : 1
 Independent conversations       : 29 distinct for 29 independent questions (follow-up reuses its setup turn: true)
 
 OUTCOME BREAKDOWN
-  model-answer           27  Ollama generated the text
+  model-answer           27  Ollama generated the text AND reported its identity
+  stub-output             0  canned test text — NOT a model answer
   refusal-by-design       3  correct refusal, model not needed
   technical-failure       0  model should have answered but did not
   inconclusive            0  no evidence found to answer from
@@ -304,22 +402,25 @@ OUTCOME BREAKDOWN
   TOTAL                  30  reconciles to 30: YES
 
 Model identifier(s) reported    : llama3.2:3b
+Embeddings used per answer      : 27 / 30
 Latency (model answers)         : p50 4210 ms, p95 11800 ms, max 15230 ms
 ```
 
 **The counts above are illustrative, not a claim.** Your numbers will differ.
 What must stay true is the shape:
 
-- **30 questions executed, exactly once each**, and the four outcome counts
+- **30 questions executed, exactly once each**, and the five outcome counts
   **sum to 30**. The runner reconciles this itself and aborts if they do not.
+- `stub-output` is **0**. Any other value means you ran the test stand-in, not a model.
 - The follow-up question's setup turn is counted as a **setup turn**, never as a
   question, so it cannot inflate the totals.
 
-### The four outcomes
+### The five outcomes
 
 | Outcome | Meaning | Counts as validation? |
 |---|---|---|
-| **model-answer** | Ollama generated the text (`mode: local-model`) | **Yes** — only this bucket |
+| **stub-output** | The text came from the canned test stand-in, not a model. Classified **first**, before anything else. | **Never** |
+| **model-answer** | Ollama generated the text **and reported its own model id** (`mode: local-model`) | **Yes** — only this bucket |
 | **refusal-by-design** | The correct outcome is a refusal (`out-of-scope` / `refused`). These questions are right with or without Ollama. | No — but confirm the refusal was right |
 | **technical-failure** | The model should have answered and did not (`model-offline`, `model-error`, `ai-disabled`), or the request returned an HTTP error | **No — a blocker** |
 | **inconclusive** | Daybook found no evidence to answer from (`no-evidence`, `builtin-guide`) | No — a retrieval outcome, not a model verdict |
@@ -342,16 +443,61 @@ broken.
 | `2` | Refused to run: Ollama unreachable, or a model not installed |
 | `3` | Ran, but **no** answer came from the model — not model validation |
 | `4` | Ran, but questions hit technical failures or were inconclusive — the run is **partial** |
-| `5` | **STUB DETECTED** — the canned test stand-in served the answers. Not validation; delete the output |
+| `5` | **STUB — NOT MODEL VALIDATION** — a declared stand-in, or canned text, served the answers. Not validation; delete the output |
 
-Exit `5` exists so a plumbing test can never be filed as a real evaluation. The
-stub's canned reply contains the word `STUB`, and the runner flags any run where
-it appears — in the console, in `results.json` (`meta.isStubRun`) and at the top
-of `REVIEW.md`.
+Exit `5` exists so a plumbing test can never be filed as a real evaluation.
+
+**How stub output is handled.** Stub provenance is **declared, not guessed**.
+The test harness sets `DAYBOOK_EVAL_STUB=1` before starting the runner, and the
+run metadata records `stubMode: "declared"`. Because the declaration is
+configuration rather than a property of the reply, a stand-in cannot slip
+through by returning plausible prose.
+
+A canned-text marker is kept as a **second, independent backstop** for a stub
+that does not declare itself. The two signals are recorded separately
+(`meta.stubMode`, `meta.stubMarkerDetected`) so the report always says which one
+fired.
+
+A response classified as `stub-output`:
+
+- is never counted in `model-answer` (the counts still reconcile to 30),
+- never carries `producedByModel: true`,
+- never carries `modelSource: reported-by-ollama` and never gets a model id,
+- is recorded with `responseSource: "stub"` and `modelSource: "stub-stand-in"`,
+- produces the console banner **`STUB — NOT MODEL VALIDATION`** and the same
+  banner at the top of `REVIEW.md`, plus `meta.isStubRun`.
+
+The same rules apply to the follow-up question's setup turn: a stub setup
+response is never attributed to a model either.
+
+> Refusals and no-evidence outcomes are **not** reclassified as stub output when
+> stub mode is declared. Those questions never reach a model at all, so they keep
+> their own honest classification — calling them "stub" would be a different
+> mistake. A stub run therefore looks like **27 `stub-output` + 3
+> `refusal-by-design`**, never 30 stub outputs.
+
+So a pure stub run looks like: `stub-output` = 27, `refusal-by-design` = 3,
+`model-answer` = 0, `modelsUsed` = `[]`, exit code **5**. If you see that, the
+plumbing works and **nothing about model quality has been measured**.
 
 > If you get exit 2, `npm run check:ollama` will tell you exactly what is missing.
 > Do not "fix" this by pointing `OLLAMA_BASE_URL` at a hosted endpoint. That
 > breaks the local-only guarantee this product is built on.
+
+### Redirects are refused
+
+Daybook only talks to `http://127.0.0.1:11434`, `http://localhost:11434` or
+`http://[::1]:11434`, and it contacts those with HTTP redirects **disabled**. A
+local server that answers `302` to somewhere else is reported as a configuration
+error and the request fails — the redirect is never followed, so no request can
+be handed onward to a remote host. Any other scheme, hostname, LAN address,
+public IP, embedded credential or path is rejected **before a connection is
+opened**.
+
+The rule applies to all three calls Daybook makes: `/api/tags` (status),
+`/api/chat` (answers) and `/api/embed` (embeddings). Tests assert that a rejected
+endpoint makes zero HTTP requests and opens zero sockets, and that a redirect
+target receives zero requests.
 
 ### Optional: watch the UI while it runs
 
@@ -361,7 +507,7 @@ uses.
 
 ---
 
-## 5. Review the results — this is the actual validation
+## 6. Review the results — this is the actual validation
 
 The runner deliberately does **not** grade answers. Keyword matching is recorded
 only as a *necessary condition* ("was the expected fact present at all"), which
@@ -458,7 +604,7 @@ Write the three totals in the spaces provided in `REVIEW.md`.
 
 ---
 
-## 6. Re-run the deterministic suites afterwards
+## 7. Re-run the deterministic suites afterwards
 
 The model runs must not have broken anything:
 
@@ -474,7 +620,7 @@ on Windows (`bash server/verify-persistence.sh`).
 
 ---
 
-## 7. What YOU must run — checklist
+## 8. What YOU must run — checklist
 
 Nothing below has been done for you. Tick as you go.
 
@@ -523,7 +669,7 @@ how good the rest of the answers look.
 
 ---
 
-## 8. Honest limits of this setup
+## 9. Honest limits of this setup
 
 - **`llama3.2:3b` is a small model.** Expect weaker multi-step reasoning and
   occasional paraphrase drift. A failure here is not automatically a Daybook bug;
@@ -544,7 +690,7 @@ how good the rest of the answers look.
 
 ---
 
-## 9. Troubleshooting
+## 10. Troubleshooting
 
 | Symptom | Cause | Fix |
 |---|---|---|
@@ -566,7 +712,7 @@ how good the rest of the answers look.
 
 ---
 
-## 10. How the evaluation runner is verified (and what is still unverified)
+## 11. How the evaluation runner is verified (and what is still unverified)
 
 The evaluation *machinery* has been verified in the sandbox. The *model* has not.
 
@@ -602,7 +748,7 @@ Everything that requires an actual model:
 The sandbox produced **zero** model-generated answers. The canned stand-in returns
 the same sentence for every question, so its outputs say nothing about quality.
 
-## 11. Files this milestone added
+## 12. Files this milestone added
 
 | File | Purpose |
 |---|---|

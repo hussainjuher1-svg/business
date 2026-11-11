@@ -130,6 +130,13 @@ async function indexSource({ businessId, sourceType, sourceId, title, text, cate
   if (!skipEmbeddings) {
     try {
       const { vectors, model, dim } = await ollama.embed(pieces, embedModel);
+      if (!model) {
+        // The embedding model did not identify itself. Storing the vectors under
+        // an unknown model would make them unmatchable at query time (a NULL
+        // never equals a NULL in SQL), so retrieval would silently fall back to
+        // full-text while reporting that embeddings were used. Refuse instead.
+        return { chunks: inserted.length, embedded: 0, embedError: 'embedding-model-unidentified' };
+      }
       for (let i = 0; i < inserted.length; i++) {
         run(
           `INSERT INTO knowledge_embeddings (chunk_id, business_id, model, dim, vector, updated_at)
@@ -141,7 +148,9 @@ async function indexSource({ businessId, sourceType, sourceId, title, text, cate
         embedded++;
       }
     } catch (err) {
-      embedError = err.code === 'EMBED_UNAVAILABLE' ? 'embedding-model-unavailable' : 'embedding-failed';
+      embedError = err.code === 'EMBED_UNAVAILABLE' ? 'embedding-model-unavailable'
+      : err.code === 'EMBED_UNIDENTIFIED' ? 'embedding-model-unidentified'
+        : 'embedding-failed';
     }
   }
 
@@ -349,14 +358,22 @@ async function searchKnowledge({ businessId, query: queryText, limit = 8, embedM
   let embedError = null;
   try {
     const { vectors, model } = await ollama.embed([queryText], embedModel);
+    if (!model) {
+      // Unidentified embedding model: the vector pass cannot be attributed to a
+      // known space, so do not claim it ran. Full-text ranking still applies.
+      throw Object.assign(new Error('embedding model did not identify itself'), { code: 'EMBED_UNIDENTIFIED' });
+    }
     const queryVec = Float32Array.from(vectors[0]);
     const rows = q(
       `SELECT e.chunk_id, e.vector FROM knowledge_embeddings e
        WHERE e.business_id = ? AND e.model = ?`,
       [businessId, model]
     );
-    const hasAny = q('SELECT COUNT(*) AS n FROM knowledge_embeddings WHERE business_id = ?', [businessId]).n;
-    if (hasAny > 0) {
+    // Only embeddings stored under the model that just answered are comparable.
+    // Counting embeddings for the business as a whole would set this flag from
+    // stale vectors belonging to a different model, which were never ranked —
+    // claiming a retrieval configuration that was not actually used.
+    if (rows.length > 0) {
       usedEmbeddings = true;
       const sims = rows.map((r) => ({ chunk_id: r.chunk_id, sim: cosine(queryVec, blobToVec(r.vector)) }));
       for (const s of sims) {
@@ -369,7 +386,9 @@ async function searchKnowledge({ businessId, query: queryText, limit = 8, embedM
       }
     }
   } catch (err) {
-    embedError = err.code === 'EMBED_UNAVAILABLE' ? 'embedding-model-unavailable' : 'embedding-failed';
+    embedError = err.code === 'EMBED_UNAVAILABLE' ? 'embedding-model-unavailable'
+      : err.code === 'EMBED_UNIDENTIFIED' ? 'embedding-model-unidentified'
+        : 'embedding-failed';
   }
 
   const queryTerms = [...new Set(tokenize(queryText))];

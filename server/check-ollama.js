@@ -23,13 +23,6 @@ const fail = (m) => { console.log(`FAIL  ${m}`); failures++; };
 const warn = (m) => console.log(`WARN  ${m}`);
 let failures = 0;
 
-function isLoopback(hostname) {
-  return hostname === 'localhost'
-    || hostname === '127.0.0.1'
-    || hostname === '::1'
-    || hostname === '[::1]'
-    || /^127\./.test(hostname);
-}
 
 async function main() {
   console.log('='.repeat(70));
@@ -44,33 +37,53 @@ async function main() {
   else fail(`Node ${process.version} is too old — Daybook needs Node 20.19+ (22 LTS recommended)`);
 
   // ---- 2. Endpoint must be local ----
+  //
+  // Validated by the SAME function the assistant uses (ollama.validateEndpoint),
+  // so this preflight cannot pass a configuration the application would reject.
   const ollama = require('./src/ai/ollama');
-  const url = ollama.baseUrl();
+
+  console.log('\nEffective configuration (from .env, same as the running app):');
+  console.log(`  OLLAMA_BASE_URL   = ${process.env.OLLAMA_BASE_URL || '(default) http://127.0.0.1:11434'}`);
+  console.log(`  OLLAMA_CHAT_MODEL = ${process.env.OLLAMA_CHAT_MODEL || '(default) llama3.2:3b'}`);
+  console.log(`  OLLAMA_EMBED_MODEL= ${process.env.OLLAMA_EMBED_MODEL || '(default) nomic-embed-text'}`);
+  if (!process.env.OLLAMA_BASE_URL) {
+    console.log('  (no .env override detected — using built-in defaults)');
+  }
+
+  const rawUrl = ollama.baseUrlRaw ? ollama.baseUrlRaw() : (process.env.OLLAMA_BASE_URL || 'http://127.0.0.1:11434');
+  const verdict = ollama.validateEndpoint(rawUrl);
+  if (!verdict.ok) {
+    console.log(`\nEndpoint: ${rawUrl}`);
+    fail(verdict.error.message);
+    console.log('      Rejected BEFORE any network request. Daybook will not contact this host.');
+  } else {
+    pass(`Endpoint is loopback (${verdict.url.hostname}) — not a public host`);
+  }
+
   let parsed;
   try {
-    parsed = new URL(url);
+    parsed = new URL(rawUrl);
   } catch {
-    console.error(`\nFAIL  OLLAMA_BASE_URL is not a valid URL: ${url}`);
-    process.exit(1);
-  }
-  console.log(`\nEndpoint: ${url}`);
-  if (isLoopback(parsed.hostname)) {
-    pass('Endpoint is loopback (127.0.0.1 / localhost) — not a public host');
-  } else {
-    fail(`Endpoint is NOT loopback: "${parsed.hostname}". Daybook is designed to talk only to a local Ollama.`);
-    console.log('      Point OLLAMA_BASE_URL at http://127.0.0.1:11434 unless you deliberately run Ollama on your own LAN.');
+    parsed = new URL('http://127.0.0.1:11434');
   }
 
   // ---- 3. Reachability ----
-  const reachable = await new Promise((resolve) => {
-    const socket = net.connect({ host: parsed.hostname.replace(/^\[|\]$/g, ''), port: Number(parsed.port || 11434) });
-    socket.setTimeout(2500);
-    socket.once('connect', () => { socket.destroy(); resolve(true); });
-    socket.once('error', () => { socket.destroy(); resolve(false); });
-    socket.once('timeout', () => { socket.destroy(); resolve(false); });
-  });
-  if (reachable) pass(`Something is listening on ${parsed.hostname}:${parsed.port || 11434}`);
-  else fail(`Nothing is listening on ${parsed.hostname}:${parsed.port || 11434} — run "ollama serve"`);
+  //
+  // Only ever probe a host that passed validation. Probing a rejected endpoint
+  // would itself be an outbound connection to a remote machine.
+  if (!verdict.ok) {
+    fail('Reachability not tested — the endpoint was rejected, so no connection was attempted.');
+  } else {
+    const reachable = await new Promise((resolve) => {
+      const socket = net.connect({ host: parsed.hostname.replace(/^\[|\]$/g, ''), port: Number(parsed.port || 11434) });
+      socket.setTimeout(2500);
+      socket.once('connect', () => { socket.destroy(); resolve(true); });
+      socket.once('error', () => { socket.destroy(); resolve(false); });
+      socket.once('timeout', () => { socket.destroy(); resolve(false); });
+    });
+    if (reachable) pass(`Something is listening on ${parsed.hostname}:${parsed.port || 11434}`);
+    else fail(`Nothing is listening on ${parsed.hostname}:${parsed.port || 11434} — run "ollama serve"`);
+  }
 
   // ---- 4. Models ----
   const status = await ollama.getStatus(true);

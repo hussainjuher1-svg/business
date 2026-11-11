@@ -35,6 +35,9 @@ function startStub(opts = {}) {
   const args = [path.join(__dirname, 'lib', 'ollama-stub.js'), String(STUB_PORT)];
   if (opts.embedReady === false) args.push('--no-embed');
   if (opts.chatReady === false) args.push('--no-chat');
+  if (opts.failEmbed) args.push('--fail-embed');
+  if (opts.anonymousEmbed) args.push('--anonymous-embed');
+  if (opts.noMarker) args.push('--no-marker');
 
   const child = spawn(process.execPath, args, { stdio: ['ignore', 'pipe', 'pipe'] });
   return new Promise((resolve, reject) => {
@@ -70,6 +73,8 @@ function runEval(env = {}) {
         OLLAMA_BASE_URL: `http://127.0.0.1:${STUB_PORT}`,
         OLLAMA_CHAT_MODEL: 'llama3.2:3b',
         OLLAMA_EMBED_MODEL: 'nomic-embed-text',
+        // Declare stub provenance up front: this run is served by the stand-in.
+        DAYBOOK_EVAL_STUB: '1',
         DAYBOOK_EVAL_DIR: outDir,
         ...env,
       },
@@ -222,8 +227,12 @@ test('classification: a degraded run is never reported as model validation', asy
 
     assert.strictEqual(meta.isStubRun, true, 'a stub-served run must be flagged');
     const review = fs.readFileSync(path.join(outDir, 'REVIEW.md'), 'utf8');
-    assert.match(review, /STUB RUN — NOT A MODEL EVALUATION/i,
-      'the review pack must carry a visible stub warning');
+    assert.match(review, /STUB/i, 'the review pack must carry a visible stub warning');
+    assert.match(review, /NOT MODEL VALIDATION/i);
+
+    // No record may be a model answer: everything came from the stand-in.
+    assert.strictEqual(records.filter((r) => r.outcome === 'model-answer').length, 0,
+      'a stub-served run must contain zero model answers');
 
     // Non-model records must carry no model identifier at all.
     for (const r of records.filter((x) => x.outcome !== 'model-answer')) {
@@ -242,8 +251,11 @@ test('eval runner records every question and never marks an answer correct', asy
     // A stub run must exit 5 ("STUB DETECTED"), never 0. Exit 0 would let a
     // canned-response run be filed as validation.
     assert.strictEqual(run.code, 5, `stub run must exit 5, got ${run.code}: ${String(run.stderr || '').slice(0, 400)}`);
-    assert.match(String(run.stderr || ''), /STUB DETECTED/i);
+    assert.match(String(run.stderr || ''), /STUB/i);
     assert.match(String(run.stderr || ''), /NOT MODEL VALIDATION/i);
+    // The banner must state the actual provenance counts, not just a warning.
+    assert.match(String(run.stderr || ''), /canned test stand-in/i);
+    assert.match(String(run.stderr || ''), /Model answers in this run: 0/i);
 
     // Each run writes to its own timestamped directory beneath the override.
     const runs = fs.readdirSync(run.outDir);
@@ -277,9 +289,12 @@ test('eval runner records every question and never marks an answer correct', asy
       assert.ok(Array.isArray(r.sources), 'record must carry sources');
       assert.ok(r.retrieval && typeof r.retrieval.passesKeywordConditions === 'boolean',
         `${r.id}: record must carry the keyword/retrieval signal`);
-      // Outcome must be one of the four declared buckets.
-      assert.ok(['model-answer', 'refusal-by-design', 'technical-failure', 'inconclusive'].includes(r.outcome),
+      // Outcome must be one of the five declared buckets.
+      assert.ok(['stub-output', 'model-answer', 'refusal-by-design', 'technical-failure', 'inconclusive'].includes(r.outcome),
         `${r.id}: unexpected outcome ${r.outcome}`);
+      // Provenance must be explicit on every record.
+      assert.ok(['old', 'stub', 'local-ollama', 'daybook-deterministic'].includes(r.responseSource) || typeof r.responseSource === 'string',
+        `${r.id}: every record must carry a responseSource`);
       // A model identifier exists only for genuine model answers.
       if (r.outcome === 'model-answer') {
         assert.ok(r.model, `${r.id}: a model answer must record the model identifier`);
@@ -288,17 +303,62 @@ test('eval runner records every question and never marks an answer correct', asy
           `${r.question}: model answers must never be auto-marked correct`);
       } else {
         assert.strictEqual(r.model, '', `${r.id}: a non-model answer must not carry a model identifier`);
-        assert.strictEqual(r.modelSource, 'not-applicable');
+        // Stub text is attributed to the stand-in; everything else has no source.
+        assert.strictEqual(r.modelSource, r.outcome === 'stub-output' ? 'stub-stand-in' : 'not-applicable',
+          `${r.id}: unexpected modelSource ${r.modelSource} for ${r.outcome}`);
         assert.strictEqual(r.reviewState, 'not-applicable');
       }
       assert.ok(!r.verdict, 'no verdict may be set automatically');
     }
 
-    // The model identifier is the real one reported, not invented.
+    // ---- STUB PROVENANCE --------------------------------------------------
+    // The stub claims `mode: local-model` and the stub's /api/tags advertises
+    // llama3.2:3b, so every weaker rule would happily call this a model answer.
+    // Provenance must win: the canned marker is classified before anything else.
     const first = records.find((r) => r.id === 1);
+    assert.match(first.answer, /STUB/, 'the stub reply must be recorded verbatim');
+    assert.strictEqual(first.outcome, 'stub-output',
+      `stub text must be classed stub-output, got ${first.outcome}`);
+    assert.strictEqual(first.producedByModel, false,
+      'stub output must NEVER be flagged as model-produced');
+    assert.strictEqual(first.responseSource, 'stub');
+    assert.strictEqual(first.modelSource, 'stub-stand-in');
+    assert.strictEqual(first.model, '', 'stub output must carry no model identifier');
+    assert.notStrictEqual(first.modelSource, 'reported-by-ollama',
+      'stub output must never be attributed to Ollama');
+    // It did still ask for the configured model; that is a request, not an identity.
     assert.strictEqual(first.requestedModel, 'llama3.2:3b');
-    assert.match(first.answer, /STUB ANSWER/, 'the stub reply must be recorded verbatim');
-    assert.strictEqual(first.producedByModel, true, 'a model-mode answer must be flagged as model-produced');
+
+    // Every single record, not just the first.
+    assert.strictEqual(records.filter((r) => r.producedByModel).length, 0,
+      'no record in a stub run may claim to be model-produced');
+    // The three questions Daybook refuses by design never reach the model at all,
+    // so they are stub-free and must stay refusals. Everything else is stub text.
+    const nonStub = records.filter((r) => r.outcome !== 'stub-output');
+    assert.strictEqual(nonStub.length, 3,
+      `expected only the 3 by-design refusals outside stub-output, got ${nonStub.length}`);
+    for (const r of nonStub) {
+      assert.strictEqual(r.outcome, 'refusal-by-design',
+        `${r.id}: the only non-stub outcome in a stub run may be an honest refusal, got ${r.outcome}`);
+    }
+    assert.strictEqual(records.filter((r) => r.modelSource === 'reported-by-ollama').length, 0,
+      'no record may claim Ollama reported its identity');
+
+    // The setup turn obeys the same rules.
+    for (const st of setupRecords) {
+      assert.strictEqual(st.outcome, 'stub-output', 'a stub setup turn is stub-output too');
+      assert.strictEqual(st.producedByModel, false);
+      assert.strictEqual(st.model, '', 'a stub setup turn must carry no model id');
+      assert.strictEqual(st.modelSource, 'stub-stand-in');
+    }
+
+    // Counts must reflect the facts: 30 stub outputs, 0 model answers.
+    assert.strictEqual(meta.tally['stub-output'], 27,
+      `expected 27 stub outputs (30 minus the 3 by-design refusals), got ${meta.tally['stub-output']}`);
+    assert.strictEqual(meta.tally['technical-failure'], 0,
+      'stub text must not be misfiled as a technical failure');
+    assert.strictEqual(meta.tally['model-answer'], 0,
+      `expected 0 model answers, got ${meta.tally['model-answer']}`);
 
     // Counts must reconcile to the question-bank size.
     assert.strictEqual(meta.totalQuestions, 30);
@@ -317,15 +377,36 @@ test('eval runner records every question and never marks an answer correct', asy
     assert.strictEqual(meta.conversations.followUpContinuesSetupTurn, true,
       'the follow-up question must reuse its setup turn conversation');
     assert.strictEqual(meta.reconciled, true, 'the runner must confirm its own counts reconcile');
-    assert.strictEqual(meta.tally['technical-failure'], 0, 'nothing should fail technically with a healthy stub');
-    assert.ok(meta.tally['refusal-by-design'] >= 1, 'questions Daybook must refuse are classed by-design');
     const sum = Object.values(meta.tally).reduce((a, b) => a + b, 0);
     assert.strictEqual(sum, 30, `outcome counts must sum to 30, got ${sum}`);
     assert.strictEqual(sum, records.length);
-    // The real-model identifier and timestamps are recorded.
-    assert.deepStrictEqual(meta.modelsUsed, ['llama3.2:3b']);
+    // No model identifier may appear anywhere in the run's metadata, because no
+    // model produced anything.
+    assert.deepStrictEqual(meta.modelsUsed, [],
+      `a stub run must list no models, got ${JSON.stringify(meta.modelsUsed)}`);
     assert.ok(meta.evaluationStartedAt && meta.finishedAt, 'evaluation timestamps must be recorded');
     assert.ok(meta.runId, 'a run id must be recorded');
+
+    // Embedding usage is tracked per answer and summarised, so a report cannot
+    // imply the intended retrieval configuration was exercised when it was not.
+    assert.ok(meta.embeddingUsage, 'metadata must record embedding usage');
+    assert.strictEqual(typeof meta.embeddingUsage.answersUsingEmbeddings, 'number');
+    assert.strictEqual(typeof meta.embeddingUsage.answersNotUsingEmbeddings, 'number');
+    assert.strictEqual(
+      meta.embeddingUsage.answersUsingEmbeddings + meta.embeddingUsage.answersNotUsingEmbeddings,
+      records.length, 'every answer must be accounted for in the embedding tally');
+    for (const r of records) {
+      assert.strictEqual(typeof r.retrieval.usedEmbeddings, 'boolean',
+        `${r.id}: each record must state whether embeddings were used`);
+    }
+    // Indexing metadata must record the real outcome of the reindex call.
+    const ix = meta.indexing;
+    assert.ok(ix, 'metadata must record the indexing step');
+    assert.strictEqual(ix.reindexHttpStatus, 200, 'reindex must have returned HTTP 200');
+    assert.ok(ix.embedded > 0, 'the stub indexed chunks, so embedded must be > 0');
+    assert.strictEqual(ix.embeddingsIndexed, true,
+      'a run that proceeded past the gate must record that indexing succeeded');
+    assert.strictEqual(ix.embedError, null, 'no embedding error should be recorded');
 
     // The review pack states the manual-review requirement.
     const review = fs.readFileSync(path.join(outDir, 'REVIEW.md'), 'utf8');
@@ -342,6 +423,168 @@ test('eval runner records every question and never marks an answer correct', asy
     const csv = fs.readFileSync(path.join(outDir, 'review.csv'), 'utf8');
     assert.match(csv, /hallucination/i);
     assert.match(csv, /reviewer/i);
+  } finally {
+    await stopStub(stub);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// Fix 5 — embedding validation is fail-closed.
+//
+// A run whose indexing failed would otherwise produce a complete-looking report
+// claiming the intended retrieval configuration was measured. These tests prove
+// the runner stops instead, and that nothing is written that could be mistaken
+// for a result.
+// ---------------------------------------------------------------------------
+
+test('eval runner aborts when reindexing fails, and writes no report', async () => {
+  const stub = await startStub({ failEmbed: true });
+  try {
+    const outDir = fs.mkdtempSync(path.join(TMP, 'failreindex-'));
+    let code = 0;
+    let stderr = '';
+    let stdout = '';
+    try {
+      execFileSync(process.execPath, [path.join(ROOT, 'server', 'eval-ollama.js')], {
+        env: {
+          ...process.env, NODE_NO_WARNINGS: '1',
+          OLLAMA_BASE_URL: `http://127.0.0.1:${STUB_PORT}`,
+          OLLAMA_CHAT_MODEL: 'llama3.2:3b',
+          OLLAMA_EMBED_MODEL: 'nomic-embed-text',
+          DAYBOOK_EVAL_DIR: outDir,
+        },
+        encoding: 'utf8', timeout: 120000,
+      });
+    } catch (err) {
+      code = err.status;
+      stderr = String(err.stderr || '');
+      stdout = String(err.stdout || '');
+    }
+
+    assert.notStrictEqual(code, 0, 'a failed reindex must never produce a successful exit');
+    assert.notStrictEqual(code, 5, 'this is not a stub-detection case; it must abort earlier');
+    assert.match(stderr, /index/i, `the failure must name indexing: ${stderr.slice(0, 400)}`);
+    assert.match(stderr, /not (been )?(validated|measured)|refus|abort|cannot claim/i,
+      'the message must say the retrieval configuration was not validated');
+
+    // Nothing scored: no results.json anywhere beneath the output dir.
+    const produced = fs.existsSync(outDir) ? fs.readdirSync(outDir) : [];
+    for (const dir of produced) {
+      const inner = path.join(outDir, dir);
+      if (fs.statSync(inner).isDirectory()) {
+        assert.ok(!fs.readdirSync(inner).includes('results.json'),
+          'a run that failed to index must not write results.json');
+      }
+    }
+    // And no question was asked.
+    assert.ok(!/Questions executed\s*:\s*30/.test(stdout),
+      'no questions may be recorded when indexing failed');
+  } finally {
+    await stopStub(stub);
+  }
+});
+
+test('eval runner aborts when the embedding model returns no identity', async () => {
+  // Vectors stored under an unknown model cannot be matched at query time, so a
+  // run built on them would silently measure full-text retrieval only.
+  const stub = await startStub({ anonymousEmbed: true });
+  try {
+    const outDir = fs.mkdtempSync(path.join(TMP, 'anonembed-'));
+    let code = 0;
+    let stderr = '';
+    try {
+      execFileSync(process.execPath, [path.join(ROOT, 'server', 'eval-ollama.js')], {
+        env: {
+          ...process.env, NODE_NO_WARNINGS: '1',
+          OLLAMA_BASE_URL: `http://127.0.0.1:${STUB_PORT}`,
+          OLLAMA_CHAT_MODEL: 'llama3.2:3b',
+          OLLAMA_EMBED_MODEL: 'nomic-embed-text',
+          DAYBOOK_EVAL_DIR: outDir,
+        },
+        encoding: 'utf8', timeout: 120000,
+      });
+    } catch (err) {
+      code = err.status;
+      stderr = String(err.stderr || '');
+    }
+    assert.notStrictEqual(code, 0, 'an unidentified embedding model must not yield a passing run');
+  } finally {
+    await stopStub(stub);
+  }
+});
+
+test('eval runner enforces the follow-up conversation id (no silent fallback)', () => {
+  // The assertion must be a throw, not a boolean recorded for the reader.
+  const src = fs.readFileSync(path.join(ROOT, 'server', 'eval-ollama.js'), 'utf8');
+  assert.match(src, /followUpEnforced/);
+  const followUpBlock = src.slice(src.indexOf('followUpEnforced'));
+  assert.ok(/throw new Error/.test(src.slice(src.lastIndexOf('/**', src.indexOf('followUpEnforced')), src.indexOf('followUpEnforced'))),
+    'a missing or mismatched follow-up conversation id must throw');
+  assert.ok(followUpBlock.length > 0);
+});
+
+test('the review pack shows the setup prompt and response', async () => {
+  const stub = await startStub();
+  try {
+    const run = runEval();
+    const runs = fs.readdirSync(run.outDir);
+    const outDir = path.join(run.outDir, runs[0]);
+    const review = fs.readFileSync(path.join(outDir, 'REVIEW.md'), 'utf8');
+    assert.match(review, /Setup turns \(context, not scored\)/,
+      'the review pack must include the setup turn');
+    assert.match(review, /\*\*Prompt sent\*\*/i, 'the setup prompt must be shown');
+    assert.match(review, /\*\*Response received\*\*/i, 'the setup response must be shown');
+    // The setup text itself, not just a heading.
+    const { setupRecords } = JSON.parse(fs.readFileSync(path.join(outDir, 'results.json'), 'utf8'));
+    assert.ok(setupRecords.length > 0);
+    assert.ok(review.includes(setupRecords[0].question.slice(0, 40)),
+      'the actual setup prompt text must appear in the review pack');
+    // And the indexing/embedding metadata the reviewer needs to judge the run.
+    assert.match(review, /Indexing \|/);
+    assert.match(review, /Embeddings used per answer/);
+    assert.match(review, /STUB/);
+  } finally {
+    await stopStub(stub);
+  }
+});
+
+test('stub mode is DECLARED, not inferred from response text', async () => {
+  // The stand-in answers with plausible prose that contains no stub marker, so
+  // text-matching alone would report a healthy "model answers" run. The declared
+  // stub mode must win: provenance is configuration, and the response text is
+  // only a backstop.
+  const stub = await startStub({ noMarker: true });
+  try {
+    const run = runEval();
+    assert.strictEqual(run.code, 5, `a declared stub run must exit 5, got ${run.code}`);
+
+    const outDir = path.join(run.outDir, fs.readdirSync(run.outDir)[0]);
+    const { meta, records } = JSON.parse(fs.readFileSync(path.join(outDir, 'results.json'), 'utf8'));
+
+    assert.strictEqual(meta.stubMode, 'declared', 'metadata must record the declaration');
+    assert.strictEqual(meta.isStubRun, true, 'a declared stub run is a stub run');
+    assert.strictEqual(meta.stubMarkerDetected, false,
+      'this stand-in emits no marker, so text detection alone would have missed it');
+    assert.ok(meta.stubDeclaration && /DAYBOOK_EVAL_STUB/.test(meta.stubDeclaration),
+      'metadata must state how provenance was decided');
+
+    // No answer may be attributed to a model, even though the text looks fine.
+    assert.strictEqual(meta.tally['model-answer'], 0,
+      'declared stub mode must leave zero model answers');
+    assert.strictEqual(meta.tally['stub-output'], 27,
+      `expected 27 stub output, got ${meta.tally['stub-output']}`);
+    assert.strictEqual(meta.tally['refusal-by-design'], 3,
+      `refusals never reach a model and must stay refusals, got ${meta.tally['refusal-by-design']}`);
+    assert.deepStrictEqual(meta.modelsUsed, [], 'no model identifier may be reported');
+    for (const r of records) {
+      assert.notStrictEqual(r.modelSource, 'reported-by-ollama',
+        `${r.id}: nothing may be attributed to Ollama in a declared stub run`);
+      assert.strictEqual(r.model, '', `${r.id}: no model identifier may be recorded`);
+    }
+
+    const review = fs.readFileSync(path.join(outDir, 'REVIEW.md'), 'utf8');
+    assert.match(review, /STUB — NOT MODEL VALIDATION/);
+    assert.match(review, /declared/);
   } finally {
     await stopStub(stub);
   }
