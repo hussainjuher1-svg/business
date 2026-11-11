@@ -8,3 +8,11 @@ data/
 *.tsbuildinfo
 client/vite.config.js
 client/vite.config.d.ts
+
+# Real-model evaluation output (may contain business data)
+eval-results/
+
+# Local isolated HVAC dataset (created on demand, never committed)
+data/hvac-eval.db
+data/hvac-eval.db-shm
+data/hvac-eval.db-wal
