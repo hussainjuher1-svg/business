@@ -30,14 +30,19 @@ jobs:
 
     env:
       CI: 'true'
-      # Keep every harness on a throwaway database. Nothing in this job is
-      # allowed to point at the repository's data directory.
-      DB_PATH: ${{ runner.temp }}/ci-daybook.db
       NODE_NO_WARNINGS: '1'
-      # NODE_ENV is deliberately NOT set job-wide. Vite builds in development
-      # mode when NODE_ENV=test, which doubles the bundle and means the build
-      # step would never verify the production output. It is set only on the
-      # test step below.
+      # Deliberately no DB_PATH here: the `runner` context is not available in
+      # jobs.<job_id>.env, and referencing it makes the whole workflow invalid
+      # (the run fails in 0s with no jobs).
+      #
+      # It is also not needed. Every harness creates its own temporary SQLite
+      # database and never opens the repository's data directory, which the final
+      # step below verifies.
+      #
+      # NODE_ENV is likewise NOT set job-wide. Vite builds in development mode
+      # when NODE_ENV=test, which roughly doubles the bundle and means the build
+      # step would not verify the production output. It is set only on the test
+      # step below.
 
     steps:
       - uses: actions/checkout@v4
@@ -103,3 +108,16 @@ jobs:
 
       - name: Client build
         run: npm run build
+
+      # The whole job must leave the repository's data directory alone. If any
+      # script fell back to the default database path it would create
+      # data/daybook.db here; catching that keeps the isolation honest rather than
+      # assumed.
+      - name: Verify the development database was never created
+        run: |
+          if [ -e data/daybook.db ]; then
+            echo "A script opened the default database path and created data/daybook.db." >&2
+            echo "Harnesses must use their own temporary databases." >&2
+            exit 1
+          fi
+          echo "No development database was created."
