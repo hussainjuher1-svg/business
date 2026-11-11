@@ -25,6 +25,8 @@ const DB_PATH = path.join(TMP_DIR, 'test.db');
 
 let server;
 const cookies = { A: '', B: '' };
+// Passwords for the demo accounts after their forced rotation.
+const PASSWORDS = { demo: '', rival: '' };
 
 async function api(method, urlPath, { body, as } = {}) {
   const headers = { 'Content-Type': 'application/json' };
@@ -80,10 +82,17 @@ test.before(async () => {
   execFileSync(process.execPath, [path.join(__dirname, '..', 'seed.js')], { env });
   await startServer();
 
-  const a = await api('POST', '/api/auth/login', { body: { email: 'demo@daybook.local', password: 'demo1234' }, as: 'A' });
-  assert.strictEqual(a.status, 200, 'demo login should succeed');
-  const b = await api('POST', '/api/auth/login', { body: { email: 'rival@daybook.local', password: 'demo1234' }, as: 'B' });
-  assert.strictEqual(b.status, 200, 'rival login should succeed');
+  // Seeded demo accounts are gated behind a forced password change (release
+  // blocker #3). Rotate first, exactly as the product requires, so these tests
+  // exercise the same path a real demo user takes.
+  const { adoptDemoAccount } = require('./lib/demo-fixture');
+  PASSWORDS.demo = await adoptDemoAccount(BASE, 'demo@daybook.local', 'A');
+  PASSWORDS.rival = await adoptDemoAccount(BASE, 'rival@daybook.local', 'B');
+
+  const a = await api('POST', '/api/auth/login', { body: { email: 'demo@daybook.local', password: PASSWORDS.demo }, as: 'A' });
+  assert.strictEqual(a.status, 200, 'demo login should succeed after rotation');
+  const b = await api('POST', '/api/auth/login', { body: { email: 'rival@daybook.local', password: PASSWORDS.rival }, as: 'B' });
+  assert.strictEqual(b.status, 200, 'rival login should succeed after rotation');
 });
 
 test.after(() => {
@@ -308,7 +317,9 @@ test('owner can add knowledge and immediately retrieve it', async () => {
 });
 
 test('staff role cannot modify knowledge', async () => {
-  const login = await api('POST', '/api/auth/login', { body: { email: 'tech@daybook.local', password: 'demo1234' }, as: 'S' });
+  const { adoptDemoAccount } = require('./lib/demo-fixture');
+  PASSWORDS.tech = await adoptDemoAccount(BASE, 'tech@daybook.local', 'S');
+  const login = await api('POST', '/api/auth/login', { body: { email: 'tech@daybook.local', password: PASSWORDS.tech }, as: 'S' });
   assert.strictEqual(login.status, 200);
   const attempt = await api('POST', '/api/knowledge', {
     body: { category: 'policy', title: 'Staff edit', content: 'should be rejected' },

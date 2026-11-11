@@ -5,6 +5,8 @@
 **Environment:** sandboxed preview container (Node 22.22.3, 2 vCPU, 3 GB RAM, x86_64)
 **Scope:** validation only — no new features added.
 
+> **Amendment (2026-11-11, later the same day).** Four release blockers identified in this report have since been fixed: login rate limiting, production demo-account isolation, a forced password change for retained demo accounts, and the payment-terms / invoice-tracking mismatch. Test counts quoted below (33 / 30 / 48) predate that work; the current totals are **76 / 30 / 48**. The verdict is unchanged and the Ollama limitation above still stands — no model-generated answer has been validated. Details: `RELEASE-BLOCKERS.md`. Sections 7 and 9 below are annotated where their findings are now out of date.
+
 ---
 
 ## Verdict
@@ -206,9 +208,9 @@ Now verified: `demo1234` → 400, `12345678` → 400.
 
 These remain and must be handled before any real deployment:
 
-1. **Demo accounts are live accounts.** `demo@`, `hvac@`, `rival@`, `tech@`, `marcus@`, `priya@` all exist with `demo1234` and are fully functional. They are labelled "(Demo Data)" in the business name but nothing prevents them being used on a deployed instance.
-2. **No forced password change, no expiry.** There is no `must_change_password` flag.
-3. **No account lockout / rate limiting** on `POST /api/auth/login`. Unlimited password guesses are possible.
+1. ~~**Demo accounts are live accounts.**~~ **FIXED.** Demo users are now flagged `is_demo=1`, both seed scripts refuse to run when `NODE_ENV=production`, and a production boot warns about retained demo accounts. See `RELEASE-BLOCKERS.md` §2.
+2. ~~**No forced password change, no expiry.**~~ **FIXED.** `must_change_password` exists: a demo account still on the published password is blocked from every business endpoint until it rotates. See `RELEASE-BLOCKERS.md` §3.
+3. ~~**No account lockout / rate limiting**~~ **FIXED.** Login is rate limited per account and per source address, persisted across restarts. See `RELEASE-BLOCKERS.md` §1.
 4. **No email verification**, so anyone can register with any address.
 5. **Seed scripts must never run against production.** They are manual (`npm run db:seed`), but nothing blocks them and `seed.js` is idempotent-by-presence rather than environment-gated.
 6. **Sessions are not revocable per-device** and expire only after 30 days.
@@ -245,11 +247,11 @@ These remain and must be handled before any real deployment:
 
 ## 9. Missing functionality that blocks real-business use
 
-1. **Invoice / payment tracking.** Referenced by policies and needed for "which invoices are unpaid?" — does not exist.
+1. **Invoice / payment tracking.** Still does not exist and is not planned for this release. The mismatch was a *messaging* defect and is fixed: the assistant and the settings screen now state plainly that Daybook does not track invoices or payments. See `RELEASE-BLOCKERS.md` §4.
 2. **Recurring appointments / maintenance plans.** HVAC depends on annual service cycles; there is no recurrence model.
 3. **Multi-business switching in the UI.** The API supports memberships; the frontend hardcodes the first business.
 4. **Audit trail for AI answers.** Sources are stored per message, but there is no owner-facing "what did the assistant tell a customer" review.
-5. **Rate limiting** anywhere in the API.
+5. ~~**Rate limiting** anywhere in the API.~~ Login is now rate limited; the rest of the API is not.
 6. **HTTPS / secure-cookie enforcement** is only via `NODE_ENV=production`; no HSTS, no CSP.
 7. **No migration path off SQLite** for concurrent multi-user use.
 8. **No automated backup schedule** — `VACUUM INTO` works but must be run manually.

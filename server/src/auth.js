@@ -35,14 +35,25 @@ function destroySession(token) {
   if (token) run('DELETE FROM sessions WHERE token_hash = ?', [tokenHash(token)]);
 }
 
+/** Revoke every session for a user — used after a password change. */
+function destroyAllSessions(userId) {
+  run('DELETE FROM sessions WHERE user_id = ?', [userId]);
+}
+
 function getSessionUser(token) {
   if (!token) return null;
   const row = get(
-    `SELECT u.id, u.email, u.name, u.created_at FROM sessions s JOIN users u ON u.id = s.user_id
+    `SELECT u.id, u.email, u.name, u.created_at, u.is_demo, u.must_change_password
+     FROM sessions s JOIN users u ON u.id = s.user_id
      WHERE s.token_hash = ? AND s.expires_at > datetime('now')`,
     [tokenHash(token)]
   );
-  return row || null;
+  if (!row) return null;
+  return {
+    ...row,
+    is_demo: !!row.is_demo,
+    must_change_password: !!row.must_change_password,
+  };
 }
 
 function getMemberships(userId) {
@@ -115,7 +126,7 @@ function clearSessionCookie(res) {
 }
 
 module.exports = {
-  COOKIE, hashPassword, verifyPassword, createSession, destroySession,
+  COOKIE, hashPassword, verifyPassword, createSession, destroySession, destroyAllSessions,
   getSessionUser, getMemberships, getMembership, requireAuth, resolveBusiness,
   requireRole, setSessionCookie, clearSessionCookie,
 };

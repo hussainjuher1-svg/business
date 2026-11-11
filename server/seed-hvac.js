@@ -19,6 +19,15 @@
 const { migrate, get, run, q } = require('./src/db');
 const { hashPassword } = require('./src/auth');
 const retrieval = require('./src/ai/retrieval');
+const demoGuard = require('./src/demo-guard');
+
+// Release blocker #2: demo credentials must never reach a production deployment.
+try {
+  demoGuard.assertSeedingAllowed('server/seed-hvac.js');
+} catch (err) {
+  console.error(`[hvac] ${err.message}`);
+  process.exit(1);
+}
 
 migrate();
 
@@ -43,14 +52,20 @@ if (!user) {
   const info = run('INSERT INTO users (email, password_hash, name) VALUES (?,?,?)', [
     'hvac@daybook.local', hashPassword(PASSWORD), 'Dana Whitfield (Owner)',
   ]);
+  demoGuard.markDemoUser(Number(info.lastInsertRowid));
   user = get('SELECT * FROM users WHERE id = ?', [Number(info.lastInsertRowid)]);
+} else if (!user.is_demo) {
+  demoGuard.markDemoUser(user.id);
 }
 
 function ensureTech(email, name) {
   let u = get('SELECT * FROM users WHERE email = ?', [email]);
   if (!u) {
     const info = run('INSERT INTO users (email, password_hash, name) VALUES (?,?,?)', [email, hashPassword(PASSWORD), name]);
+    demoGuard.markDemoUser(Number(info.lastInsertRowid));
     u = get('SELECT * FROM users WHERE id = ?', [Number(info.lastInsertRowid)]);
+  } else if (!u.is_demo) {
+    demoGuard.markDemoUser(u.id);
   }
   return u;
 }
@@ -87,7 +102,7 @@ for (const [u, role] of [[user, 'owner'], [tech1, 'staff'], [tech2, 'staff']]) {
 
 if (q('SELECT id FROM customers WHERE business_id = ?', [biz.id]).length > 0) {
   console.log('[hvac] dataset already present — skipping.');
-  console.log('[hvac] Login: hvac@daybook.local / demo1234');
+  console.log('[hvac] Login: hvac@daybook.local / demo1234  (is_demo=1, password change forced)');
   process.exit(0);
 }
 
@@ -399,7 +414,7 @@ async function main() {
   };
   console.log('[hvac] FICTIONAL PILOT DATASET created for', BIZ_NAME);
   console.log('[hvac] records:', JSON.stringify(counts));
-  console.log('[hvac] Login: hvac@daybook.local / demo1234');
+  console.log('[hvac] Login: hvac@daybook.local / demo1234  (is_demo=1, password change forced)');
   process.exit(0);
 }
 

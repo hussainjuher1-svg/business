@@ -39,7 +39,7 @@ export const api = {
   },
 };
 
-export interface User { id: number; email: string; name: string }
+export interface User { id: number; email: string; name: string; isDemo?: boolean; mustChangePassword?: boolean }
 export interface Membership { business_id: number; role: string; business_name: string; timezone: string; currency: string }
 export interface AuthResponse { user: User; businesses: Membership[] }
 

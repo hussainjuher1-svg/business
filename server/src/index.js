@@ -9,17 +9,65 @@ const apiRouter = require('./routes');
 const assistantRouter = require('./assistant');
 const knowledgeRouter = require('./knowledge');
 const onboardingRouter = require('./onboarding');
+const demoGuard = require('./demo-guard');
 
 migrate();
 
+// Retained demo accounts must not keep working with the published password.
+const demoState = demoGuard.enforceDemoPasswordRotation();
+if (demoState.production && demoState.retained.length) {
+  console.warn(
+    `[daybook] WARNING: ${demoState.retained.length} demo account(s) exist in a PRODUCTION deployment ` +
+    `(${demoState.retained.map((u) => u.email).join(', ')}). Delete them before real use.`
+  );
+} else if (demoState.forced) {
+  console.log(`[daybook] forced password change on ${demoState.forced} demo account(s) still using the published demo password`);
+}
+
 const app = express();
 const PORT = process.env.PORT || 3001;
+
+// Hosting platforms put Daybook behind exactly one proxy hop. Express then
+// resolves req.ip from the right-hand side of X-Forwarded-For, so the rate
+// limiter sees a real address that a client cannot spoof. Off by default:
+// trusting the header without a proxy in front is worse than not trusting it.
+if (process.env.TRUST_PROXY) {
+  app.set('trust proxy', Number.isNaN(Number(process.env.TRUST_PROXY)) ? process.env.TRUST_PROXY : Number(process.env.TRUST_PROXY));
+}
 
 app.use(cors({ origin: true, credentials: true }));
 app.use(express.json({ limit: '5mb' }));
 app.use(cookieParser());
 
 app.get('/health', (req, res) => res.json({ ok: true, service: 'daybook-api', db: DB_PATH }));
+
+/**
+ * Global gate for retained demo accounts that still use the published password.
+ * Applies to every /api route except the ones needed to complete the change.
+ * A demo session cannot read or write business data until it has rotated.
+ */
+const PASSWORD_CHANGE_EXEMPT = new Set([
+  '/api/auth/me',
+  '/api/auth/change-password',
+  '/api/auth/logout',
+  '/api/auth/login',
+  '/api/auth/register',
+]);
+
+app.use('/api', (req, res, next) => {
+  if (PASSWORD_CHANGE_EXEMPT.has(req.path) || PASSWORD_CHANGE_EXEMPT.has(`/api${req.path}`)) return next();
+  // Resolve the session here only to check the flag; routers authenticate again.
+  const { getSessionUser } = require('./auth');
+  const user = getSessionUser(req.cookies?.daybook_session);
+  if (user?.must_change_password) {
+    return res.status(403).json({
+      error: 'You must change your password before using Daybook. This demo account is still using the published demo password.',
+      code: 'PASSWORD_CHANGE_REQUIRED',
+    });
+  }
+  next();
+});
+
 app.use('/api', apiRouter);
 app.use('/api/assistant', assistantRouter);
 app.use('/api/knowledge', knowledgeRouter);

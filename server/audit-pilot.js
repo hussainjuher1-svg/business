@@ -1,8 +1,17 @@
 /**
  * PILOT AUDIT — workflows, security, and capability honesty.
- * Run against a running server: node server/audit-pilot.js [baseUrl]
+ *
+ * ISOLATION: by default this starts its own server on its own temporary
+ * database (port 3301), so it never reads or writes the development database.
+ * Pass a base URL to audit an already-running instance instead:
+ *   node server/audit-pilot.js http://127.0.0.1:3001
  */
-const BASE = process.argv[2] || 'http://127.0.0.1:3001';
+const { createInstance } = require('./test/lib/test-instance');
+
+const EXTERNAL_BASE = process.argv[2] || '';
+const PORT = 3301;
+let BASE = EXTERNAL_BASE || `http://127.0.0.1:${PORT}`;
+let instance = null;
 
 let pass = 0;
 let fail = 0;
@@ -31,12 +40,22 @@ function jar() {
 }
 
 async function main() {
+  if (!EXTERNAL_BASE) {
+    instance = await createInstance({ name: 'audit-pilot', port: PORT });
+    BASE = instance.baseUrl;
+  }
+
   console.log('='.repeat(78));
   console.log('DAYBOOK PILOT AUDIT — workflows, security, capability honesty');
   console.log('='.repeat(78));
+  console.log(EXTERNAL_BASE ? `Target: ${BASE} (external instance)` : `Test database: ${instance.dbPath}`);
 
   const hvac = jar();
-  const login = await hvac('POST', '/api/auth/login', { email: 'hvac@daybook.local', password: 'demo1234' });
+  // Release blocker #3: seeded demo accounts must rotate the published password
+  // before they can touch business data. Rotate the way the product requires.
+  const { adoptDemoAccount } = require('./test/lib/demo-fixture');
+  const hvacPassword = await adoptDemoAccount(BASE, 'hvac@daybook.local', 'audit-hvac');
+  const login = await hvac('POST', '/api/auth/login', { email: 'hvac@daybook.local', password: hvacPassword });
   record('HVAC demo account logs in', login.status === 200, JSON.stringify(login.data).slice(0, 120));
 
   // ---------------------------------------------------------------------
@@ -44,14 +63,20 @@ async function main() {
   // ---------------------------------------------------------------------
   console.log('\n--- SECURITY: demo credentials ---');
   const demoEmails = ['demo@daybook.local', 'hvac@daybook.local', 'rival@daybook.local', 'tech@daybook.local', 'marcus@daybook.local', 'priya@daybook.local'];
+  // Point the in-process DB handle at the same database the server is using,
+  // before requiring it. An external target keeps its own DB path via env.
+  if (instance) process.env.DB_PATH = instance.dbPath;
   const { q } = require('./src/db');
   for (const email of demoEmails) {
-    const row = q('SELECT email, password_hash FROM users WHERE email = ?', [email]);
+    const row = q('SELECT email, password_hash, is_demo, must_change_password FROM users WHERE email = ?', [email]);
     if (!row.length) { record(`demo account ${email} absent`, true); continue; }
-    // bcrypt/scrypt demo hash check: does 'demo1234' verify?
     const { verifyPassword } = require('./src/auth');
-    const verifies = verifyPassword('demo1234', row[0].password_hash);
-    record(`demo account ${email} exists but is clearly demo-only`, verifies, `weak default password still active`);
+    // Release blockers #2/#3: a demo account must be labelled as demo, and the
+    // published password must either be gone or locked behind the forced change.
+    const stillDemoPassword = verifyPassword('demo1234', row[0].password_hash);
+    const contained = row[0].is_demo === 1 && (!stillDemoPassword || row[0].must_change_password === 1);
+    record(`demo account ${email} is flagged and its published password is contained`, contained,
+      contained ? '' : `is_demo=${row[0].is_demo} demo1234_still_works=${stillDemoPassword} must_change=${row[0].must_change_password}`);
   }
 
   // Can a brand-new (real) business be created with the demo password?
@@ -74,7 +99,8 @@ async function main() {
   // ---------------------------------------------------------------------
   console.log('\n--- SECURITY: cross-business isolation ---');
   const rival = jar();
-  await rival('POST', '/api/auth/login', { email: 'rival@daybook.local', password: 'demo1234' });
+  const rivalPassword = await adoptDemoAccount(BASE, 'rival@daybook.local', 'audit-rival');
+  await rival('POST', '/api/auth/login', { email: 'rival@daybook.local', password: rivalPassword });
 
   const hvacIdRes = await hvac('GET', '/api/auth/me');
   const hvacId = hvacIdRes.data.businesses[0].business_id;
@@ -103,7 +129,8 @@ async function main() {
   // ---------------------------------------------------------------------
   console.log('\n--- SECURITY: role enforcement ---');
   const staff = jar();
-  await staff('POST', '/api/auth/login', { email: 'marcus@daybook.local', password: 'demo1234' });
+  const staffPassword = await adoptDemoAccount(BASE, 'marcus@daybook.local', 'audit-staff');
+  await staff('POST', '/api/auth/login', { email: 'marcus@daybook.local', password: staffPassword });
   const staffWrite = await staff('POST', '/api/knowledge', { category: 'policy', title: 'x', content: 'y' });
   record('staff cannot create knowledge', staffWrite.status === 403, `status=${staffWrite.status}`);
   const staffAi = await staff('PATCH', '/api/assistant/settings', { enabled: false });
@@ -255,7 +282,12 @@ async function main() {
     console.log('\nFAILURES:');
     for (const f of failures) console.log(`  · ${f.name}${f.detail ? ` — ${f.detail}` : ''}`);
   }
+  if (instance) await instance.cleanup();
   process.exit(fail === 0 ? 0 : 1);
 }
 
-main().catch((e) => { console.error('AUDIT ERROR:', e); process.exit(2); });
+main().catch(async (e) => {
+  console.error('AUDIT ERROR:', e);
+  if (instance) await instance.cleanup();
+  process.exit(2);
+});

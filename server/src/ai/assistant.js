@@ -208,12 +208,15 @@ function classifyRefusal(text) {
   if (offDomain) {
     const hasFinance = /\b(profit|revenue|turnover|margin|payroll|salary|salaries|tax|vat|gst|balance sheet|cash ?flow)\b/i.test(text);
     const hasStock = /\b(inventory|stock|in stock|on hand|stock level|parts? (available|remaining))\b/i.test(text);
+    const asksPaymentStatus = asksAboutSettlement(text);
     return {
       answer: hasFinance
         ? 'Daybook does not record financial results such as profit, revenue, margins or payroll, so I have no data to answer that and I will not estimate. ' +
           'I can tell you about inquiries, estimates, appointments, jobs, follow-ups, customers and business knowledge. ' +
           'Accounting figures live in your bookkeeping or accounting system.'
-        : hasStock
+        : asksPaymentStatus
+          ? PAYMENT_ANSWER
+          : hasStock
           ? 'Daybook does not track inventory or parts stock, so I cannot tell you what is on hand. I will not guess a quantity. ' +
             'If your price list mentions a part, that is pricing only — it says nothing about availability.'
           : 'That is outside what Daybook holds. I only answer from this business\'s knowledge base and its Daybook records, ' +
@@ -226,18 +229,81 @@ function classifyRefusal(text) {
   return null;
 }
 
+/**
+ * Release blocker #4 — payment terms vs. invoice tracking.
+ *
+ * Daybook stores what the business *says* about payment and what it *quoted*
+ * (estimates) and when it scheduled work. It does NOT record invoices, whether
+ * a customer has paid, balances, or ageing. The assistant must never imply it
+ * does. These messages are the single source of that wording.
+ */
+const PAYMENT_TERMS_NOTE =
+  'Daybook stores your payment terms as business knowledge, and it tracks estimates and their status ' +
+  '(draft, sent, awaiting response, accepted, declined, expired). It does not create invoices and it does not ' +
+  'record payments, balances or which customers have paid.';
+
+const PAYMENT_ANSWER =
+  'I can tell you what your payment terms say, and I can show estimate status — but ' +
+  'Daybook does not track invoices or payments, so I cannot tell you who has paid, what is outstanding, ' +
+  'or how old a debt is. ' +
+  'Payment terms are recorded as business knowledge; invoice and payment records live in your accounting system.';
+
+/**
+ * Unambiguous settlement phrases — enough on their own.
+ */
+const PAYMENT_STATUS_QUESTION =
+  /\b(paid|unpaid|payment status|who owes|outstanding|balance due|arrears|has \w+ paid)\b/i;
+
+/**
+ * A bare "overdue" is NOT enough: "which follow-ups are overdue?" is a question
+ * Daybook can answer from its own records. But an invoice/billing word combined
+ * with any settlement word does mean settlement state, in either order, because
+ * owners write "which invoices are overdue?" as often as "which invoices are
+ * unpaid?".
+ */
+const PAYMENT_SETTLEMENT_WORD = /\b(paid|unpaid|overdue|outstanding|owing|owes|arrears|balance due)\b/i;
+const PAYMENT_DOCUMENT_WORD = /\b(invoice[sd]?|billing|receivable[s]?|statement[s]?|account[s]?)\b/i;
+
+/** Does this question ask about who has paid / what is owed? */
+function asksAboutSettlement(text) {
+  const question = String(text || '');
+  if (PAYMENT_STATUS_QUESTION.test(question)) return true;
+  return PAYMENT_DOCUMENT_WORD.test(question) && PAYMENT_SETTLEMENT_WORD.test(question);
+}
+
+const PAYMENT_TERMS_QUESTION =
+  /\b(payment terms?|payment polic(y|ies)|when (do|should) (we|customers?) pay|how (do|should) customers? pay|when (must|are|do|will|should) [^.?!\n]{0,30}\bpaid|payment due|deposit|invoice terms?|net ?30|late (fee|charge))/i;
+
+/** Strong evidence that the question asks about a specific account's settlement state. */
+const PAYMENT_SETTLEMENT_QUESTION =
+  /\b(unpaid|who owes|outstanding|overdue|balance due|arrears|has \w+ paid|which customers? (have|has) paid|paid (us|yet))/i;
+
+/**
+ * "When must invoices be paid?" is a question about the business's *terms*, and
+ * the knowledge base can answer it. "Which invoices are unpaid?" is a question
+ * about settlement state, which Daybook cannot answer. Both contain "paid", so
+ * the distinction is made explicitly instead of by one broad regex.
+ */
+function isPaymentTermsOnly(question) {
+  return PAYMENT_TERMS_QUESTION.test(question) && !PAYMENT_SETTLEMENT_QUESTION.test(question);
+}
+
 /** Capability questions (needed for an honest "no data" message). */
 const CAPABILITY_TOPICS = [
   { re: /\b(profit|revenue|margin|payroll|salary|tax|vat|gst|balance sheet|cash ?flow|financial|financ)/i, area: 'financial results', tracked: false },
   { re: /\b(inventory|stock level|parts on hand)/i, area: 'inventory', tracked: false },
   { re: /\b(employee timesheet|hours worked|payroll hours)/i, area: 'timesheets', tracked: false },
-  { re: /\b(invoice|billing|paid|unpaid|payment status)/i, area: 'invoice and payment tracking', tracked: false },
+  { re: /\b(invoice[sd]?|billing|paid|unpaid|payment status|who owes|outstanding|balance due|arrears)/i, area: 'invoices and payments', tracked: false },
   { re: /\b(contract|signed agreement|paperwork)/i, area: 'signed contracts', tracked: false },
 ];
 
 function missingKnowledgeMessage(question) {
+  // Ask about payment STATUS → answer with the exact capability boundary.
+  if (asksAboutSettlement(question)) return PAYMENT_ANSWER;
+
   const topic = CAPABILITY_TOPICS.find((t) => t.re.test(question));
   if (topic && !topic.tracked) {
+    if (topic.area === 'invoices and payments') return PAYMENT_ANSWER;
     return `Daybook does not currently track ${topic.area}, so I have no records to draw on and I will not guess. ` +
       'I can answer questions about services, pricing, policies, customers, inquiries, estimates, appointments, jobs and follow-ups.';
   }
@@ -531,6 +597,22 @@ async function answer({ businessId, userId, question, history = [], useCache = t
     return { ...base, ...refusal, sources: [], latencyMs: Date.now() - started };
   }
 
+  // ---- payment status: Daybook has no invoice/payment data at all. ----
+  // This must be decided before any evidence branch. A question like "which
+  // customers have unpaid invoices?" also matches the customer record tool, so
+  // without this gate the owner would get a customer list dumped under a
+  // question about money owed, implying Daybook knows something it does not.
+  if (asksAboutSettlement(question) && !isPaymentTermsOnly(question)) {
+    return {
+      ...base,
+      answer: PAYMENT_ANSWER,
+      mode: 'out-of-scope',
+      grounding: 'none',
+      sources: [],
+      latencyMs: Date.now() - started,
+    };
+  }
+
   // ---- help questions are answered deterministically (they are about Daybook) ----
   if (isHelpQuestion(question)) {
     return { ...base, answer: helpAnswer(question), mode: 'builtin-guide', grounding: 'verified', latencyMs: Date.now() - started };
@@ -698,6 +780,13 @@ function helpAnswer(question) {
 
 module.exports = {
   answer,
+  PAYMENT_ANSWER,
+  PAYMENT_TERMS_NOTE,
+  PAYMENT_STATUS_QUESTION,
+  PAYMENT_TERMS_QUESTION,
+  PAYMENT_SETTLEMENT_QUESTION,
+  isPaymentTermsOnly,
+  asksAboutSettlement,
   computeGaps,
   findConflicts,
   getAiSettings,

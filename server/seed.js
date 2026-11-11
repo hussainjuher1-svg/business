@@ -11,6 +11,16 @@
 const { migrate, get, run, q } = require('./src/db');
 const { hashPassword } = require('./src/auth');
 const retrieval = require('./src/ai/retrieval');
+const demoGuard = require('./src/demo-guard');
+
+// Release blocker #2: demo credentials must never reach a production deployment.
+// This check runs BEFORE migrate() so nothing is written either.
+try {
+  demoGuard.assertSeedingAllowed('server/seed.js');
+} catch (err) {
+  console.error(`[seed] ${err.message}`);
+  process.exit(1);
+}
 
 migrate();
 
@@ -32,7 +42,12 @@ function ensureUser(email, name) {
   let user = get('SELECT * FROM users WHERE email = ?', [email]);
   if (!user) {
     const info = run('INSERT INTO users (email, password_hash, name) VALUES (?,?,?)', [email, hashPassword(PASSWORD), name]);
-    user = get('SELECT * FROM users WHERE id = ?', [Number(info.lastInsertRowid)]);
+    const id = Number(info.lastInsertRowid);
+    demoGuard.markDemoUser(id);
+    user = get('SELECT * FROM users WHERE id = ?', [id]);
+  } else if (!user.is_demo) {
+    // Existing account from an older seed: mark it so the guard sees it.
+    demoGuard.markDemoUser(user.id);
   }
   return user;
 }
@@ -332,4 +347,5 @@ All prices exclude parts unless stated. Prices reviewed every January.`;
 console.log('[seed] Business A login: demo@daybook.local / demo1234');
 console.log('[seed] Business B login: rival@daybook.local / demo1234  (isolation test)');
 console.log('[seed] NOTE: all records above are demonstration data, not real customer activity.');
+console.log('[seed] All accounts are flagged is_demo=1 and must change password before real use.');
 process.exit(0);

@@ -99,6 +99,11 @@ export default function Settings() {
         <Field label="Service areas"><textarea rows={2} value={form.service_areas || ''} onChange={(e) => setForm({ ...form, service_areas: e.target.value })} /></Field>
         <Field label="Business policies"><textarea rows={3} value={form.policies || ''} onChange={(e) => setForm({ ...form, policies: e.target.value })} placeholder="Cancellation policy, terms, etc." /></Field>
         <Field label="Payment methods"><input value={form.payment_methods || ''} onChange={(e) => setForm({ ...form, payment_methods: e.target.value })} placeholder="e.g. Cash, card, bank transfer" /></Field>
+        <p className="rounded-lg border border-stone-200 bg-stone-50 px-3 py-2 text-[11px] text-stone-600">
+          <strong>What Daybook tracks:</strong> your payment terms (as knowledge), services and prices, and estimate
+          status. <strong>What it does not track:</strong> invoices, payments received, outstanding balances or who has paid.
+          Keep those in your accounting system — the assistant will tell you the same thing rather than guess.
+        </p>
         <div className="grid grid-cols-2 gap-3">
           <Field label="Currency"><input value={form.currency || ''} onChange={(e) => setForm({ ...form, currency: e.target.value })} /></Field>
           <Field label="Timezone"><input value={form.timezone || ''} onChange={(e) => setForm({ ...form, timezone: e.target.value })} placeholder="e.g. UTC, Asia/Dhaka" /></Field>

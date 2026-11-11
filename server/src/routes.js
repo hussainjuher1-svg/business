@@ -1,7 +1,9 @@
 const express = require('express');
 const { z } = require('zod');
 const { q, get, run, logActivity } = require('./db');
-const { hashPassword, verifyPassword, createSession, destroySession, getMemberships, requireAuth, resolveBusiness, requireRole, setSessionCookie, clearSessionCookie } = require('./auth');
+const { hashPassword, verifyPassword, createSession, destroySession, destroyAllSessions, getMemberships, requireAuth, resolveBusiness, requireRole, setSessionCookie, clearSessionCookie } = require('./auth');
+const loginGuard = require('./login-guard');
+const demoGuard = require('./demo-guard');
 
 const router = express.Router();
 
@@ -96,19 +98,77 @@ router.post('/auth/register', (req, res) => {
   logActivity(businessId, userId, 'business', businessId, 'created', `Business "${businessName}" created`);
   const token = createSession(userId);
   setSessionCookie(res, token);
-  res.status(201).json({ user: { id: userId, email, name }, businesses: getMemberships(userId) });
+  res.status(201).json({
+    user: { id: userId, email, name, isDemo: false, mustChangePassword: false },
+    businesses: getMemberships(userId),
+  });
 });
 
-router.post('/auth/login', (req, res) => {
+router.post('/auth/login', loginGuard.loginRateLimit, (req, res) => {
   const parsed = z.object({ email: emailSchema, password: z.string().min(1) }).safeParse(req.body);
   if (!parsed.success) return fail(res, 400, parsed.error.errors[0].message);
-  const user = get('SELECT * FROM users WHERE email = ?', [parsed.data.email.toLowerCase()]);
+  const email = parsed.data.email.toLowerCase();
+  const user = get('SELECT * FROM users WHERE email = ?', [email]);
+
   if (!user || !verifyPassword(parsed.data.password, user.password_hash)) {
+    loginGuard.recordFailure(req, email);
     return fail(res, 401, 'Invalid email or password.');
   }
+
+  loginGuard.recordSuccess(req, email);
   const token = createSession(user.id);
   setSessionCookie(res, token);
-  res.json({ user: { id: user.id, email: user.email, name: user.name }, businesses: getMemberships(user.id) });
+  res.json({
+    user: {
+      id: user.id,
+      email: user.email,
+      name: user.name,
+      isDemo: !!user.is_demo,
+      mustChangePassword: !!user.must_change_password,
+    },
+    businesses: getMemberships(user.id),
+  });
+});
+
+/**
+ * Forced password change (release blocker #3).
+ * Requires a valid session, verifies the current password, applies the shared
+ * policy, revokes all sessions, and issues a fresh one.
+ */
+router.post('/auth/change-password', requireAuth, (req, res) => {
+  const parsed = z.object({
+    currentPassword: z.string().min(1, 'Current password is required'),
+    newPassword: z.string().min(1, 'New password is required'),
+  }).safeParse(req.body);
+  if (!parsed.success) return fail(res, 400, parsed.error.errors[0].message);
+
+  const user = get('SELECT * FROM users WHERE id = ?', [req.user.id]);
+  if (!user) return fail(res, 404, 'Account not found.');
+
+  if (!verifyPassword(parsed.data.currentPassword, user.password_hash)) {
+    loginGuard.recordFailure(req, user.email);
+    return fail(res, 401, 'Current password is incorrect.');
+  }
+
+  if (parsed.data.currentPassword === parsed.data.newPassword) {
+    return fail(res, 400, 'New password must be different from the current password.');
+  }
+
+  const problem = demoGuard.validateNewPassword(parsed.data.newPassword);
+  if (problem) return fail(res, 400, problem);
+
+  run(
+    `UPDATE users SET password_hash = ?, must_change_password = 0, password_changed_at = datetime('now'), updated_at = datetime('now')
+     WHERE id = ?`,
+    [hashPassword(parsed.data.newPassword), user.id]
+  );
+
+  // Force re-login everywhere with the new credential.
+  destroyAllSessions(user.id);
+  const token = createSession(user.id);
+  setSessionCookie(res, token);
+
+  res.json({ ok: true, mustChangePassword: false, user: { id: user.id, email: user.email, name: user.name } });
 });
 
 router.post('/auth/logout', requireAuth, (req, res) => {
@@ -118,7 +178,17 @@ router.post('/auth/logout', requireAuth, (req, res) => {
 });
 
 router.get('/auth/me', requireAuth, (req, res) => {
-  res.json({ user: { id: req.user.id, email: req.user.email, name: req.user.name }, businesses: getMemberships(req.user.id) });
+  res.json({
+    user: {
+      id: req.user.id,
+      email: req.user.email,
+      name: req.user.name,
+      isDemo: !!req.user.is_demo,
+      mustChangePassword: !!req.user.must_change_password,
+    },
+    businesses: getMemberships(req.user.id),
+    environment: demoGuard.isProduction() ? 'production' : 'development',
+  });
 });
 
 // ---------- businesses / settings ----------

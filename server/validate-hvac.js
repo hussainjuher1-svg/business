@@ -1,17 +1,20 @@
 /**
- * PILOT VALIDATION HARNESS — runs 24 assistant questions against the fictional
- * HVAC demo business and checks each answer against the real database.
+ * PILOT VALIDATION HARNESS — runs 30 assistant questions against the fictional
+ * HVAC demo business and checks each answer against the database.
  *
  * This is a validation instrument, not a unit test: it prints a full transcript
  * with pass/fail per assertion so a human can audit what actually happened.
  *
+ * ISOLATION: runs against its own temporary database and its own server on
+ * port 3201. The development database (data/daybook.db) is never opened,
+ * seeded, or modified by this harness.
+ *
  * Run: node server/validate-hvac.js
  */
-const { spawn } = require('node:child_process');
-const path = require('node:path');
+const { createInstance } = require('./test/lib/test-instance');
 
 const PORT = 3201;
-const BASE = `http://127.0.0.1:${PORT}`;
+let BASE = `http://127.0.0.1:${PORT}`;
 let cookie = '';
 
 async function api(method, urlPath, body) {
@@ -204,18 +207,15 @@ function checkCase(c, res) {
 }
 
 async function main() {
-  const server = spawn(process.execPath, [path.join(__dirname, 'src', 'index.js')], {
-    env: { ...process.env, PORT: String(PORT), NODE_NO_WARNINGS: '1' },
-    stdio: ['ignore', 'pipe', 'pipe'],
-  });
-  await new Promise((resolve, reject) => {
-    let out = '';
-    server.stdout.on('data', (d) => { out += d; if (out.includes('API listening')) resolve(); });
-    server.on('exit', (c) => reject(new Error(`server exited ${c}\n${out}`)));
-    setTimeout(() => reject(new Error(`start timeout\n${out}`)), 20000);
-  });
+  const instance = await createInstance({ name: 'validate-hvac', port: PORT });
+  BASE = instance.baseUrl;
+  console.log(`Test database: ${instance.dbPath}`);
 
-  const login = await api('POST', '/api/auth/login', { email: 'hvac@daybook.local', password: 'demo1234' });
+  // The seeded demo account is gated behind a forced password change
+  // (release blocker #3). Rotate it the way the product requires, then log in.
+  const { adoptDemoAccount } = require('./test/lib/demo-fixture');
+  const hvacPassword = await adoptDemoAccount(BASE, 'hvac@daybook.local', 'hvac');
+  const login = await api('POST', '/api/auth/login', { email: 'hvac@daybook.local', password: hvacPassword });
   if (login.status !== 200) throw new Error(`login failed: ${JSON.stringify(login.data)}`);
 
   const status = await api('GET', '/api/assistant/status');
@@ -287,7 +287,7 @@ async function main() {
     }
   }
 
-  server.kill();
+  await instance.cleanup();
   process.exit(fail === 0 ? 0 : 1);
 }
 
