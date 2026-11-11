@@ -23,9 +23,15 @@ down afterwards.
 | **`llama3.2:3b`** | answers questions | ~2 GB download |
 | **`nomic-embed-text`** | embeddings for retrieval | ~275 MB download |
 
-Daybook talks to **one** endpoint: `http://127.0.0.1:11434`. There is no paid
-provider, no API key setting, and no cloud fallback anywhere in the codebase —
-`server/src/ai/ollama.js` is the only file that contacts a model.
+Daybook talks to a **loopback-only** endpoint. The default is
+`http://127.0.0.1:11434`; `http://localhost:11434` and `http://[::1]:11434` also
+work, as does any other address in `127.0.0.0/8` on any port. Everything else —
+`https`, LAN ranges, public IPs, `0.0.0.0`, `*.local`, embedded credentials and
+paths — is rejected before a connection is opened, and redirects are never
+followed.
+
+There is no paid provider, no API key setting, and no cloud fallback anywhere in
+the codebase — `server/src/ai/ollama.js` is the only file that contacts a model.
 
 ---
 
@@ -490,9 +496,24 @@ Daybook only talks to `http://127.0.0.1:11434`, `http://localhost:11434` or
 `http://[::1]:11434`, and it contacts those with HTTP redirects **disabled**. A
 local server that answers `302` to somewhere else is reported as a configuration
 error and the request fails — the redirect is never followed, so no request can
-be handed onward to a remote host. Any other scheme, hostname, LAN address,
-public IP, embedded credential or path is rejected **before a connection is
-opened**.
+be handed onward to a remote host.
+
+The full allow-list, as enforced by `validateEndpoint`:
+
+| Endpoint | Accepted |
+|---|---|
+| `http://127.0.0.1:11434` | yes (default) |
+| `http://localhost:11434` | yes |
+| `http://[::1]:11434` | yes |
+| another `127.0.0.0/8` address, any port | yes (still loopback) |
+| `https://…` | no — rejected |
+| `192.168.*`, `10.*`, `172.16–31.*` (LAN) | no — rejected |
+| public IPs, `0.0.0.0`, `::ffff:` mapped public IPs | no — rejected |
+| `*.local` mDNS names | no — rejected |
+| embedded credentials, non-empty path | no — rejected |
+
+Rejection happens **before a connection is opened**, so a LAN Ollama is not a
+supported configuration even though it is "private".
 
 The rule applies to all three calls Daybook makes: `/api/tags` (status),
 `/api/chat` (answers) and `/api/embed` (embeddings). Tests assert that a rejected

@@ -45,7 +45,23 @@ Configure via `.env` (see `.env.example`) or per-business in **Settings → Loca
 
 `llama3.2:3b` is ~2 GB and runs on a laptop CPU. Any Ollama chat model works.
 
-> **Deployment note:** if Daybook is hosted on a remote server, that server cannot reach `localhost` Ollama on the owner's machine. Local-only AI means Daybook is designed to run where Ollama runs (owner's machine or their own LAN/host). It needs no internet connection to answer questions.
+> **Deployment note:** Daybook and Ollama must run **on the same machine**.
+> `OLLAMA_BASE_URL` is restricted to the loopback interface, and anything else is
+> rejected before a connection is opened:
+>
+> | Endpoint | Accepted |
+> |---|---|
+> | `http://127.0.0.1:11434` | yes (default) |
+> | `http://localhost:11434` | yes |
+> | `http://[::1]:11434` | yes |
+> | any other address in `127.0.0.0/8`, any port | yes (still loopback) |
+> | `https://…`, `192.168.*`, `10.*`, `172.16–31.*`, public IPs, `0.0.0.0`, `*.local` | **no — rejected** |
+> | embedded credentials or a non-empty path | **no — rejected** |
+>
+> So a remote server cannot reach the owner's laptop Ollama, and **a LAN address
+> is not a supported configuration** even though it is "private". HTTP redirects
+> are also refused, so a local server cannot hand the request onward. It needs no
+> internet connection to answer questions.
 
 ## Business Knowledge Center
 

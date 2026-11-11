@@ -73,15 +73,24 @@ This proves: the request shape is correct, the model name is passed through, ret
                                    │  Ollama daemon           │
                                    │   llama3.2:3b            │
                                    └──────────────────────────┘
-                                     same host or same private network
+                                     SAME HOST ONLY (loopback)
 ```
 
 Rules that make this safe:
 
 1. **Ollama binds to loopback only.** `OLLAMA_HOST=127.0.0.1:11434` (the default). Never `0.0.0.0`. Ollama has no authentication of its own — exposing the port is equivalent to handing out an unauthenticated shell against your model.
+
+   Enforced on the client side too. `validateEndpoint` accepts only
+   `http://127.0.0.1:11434`, `http://localhost:11434`, `http://[::1]:11434`, or
+   another address in `127.0.0.0/8` (any port). `https`, LAN ranges
+   (`192.168.*`, `10.*`, `172.16–31.*`), public IPs, `0.0.0.0`,
+   IPv4-mapped public addresses, `*.local` names, embedded credentials and
+   non-empty paths are all rejected **before a socket is opened**. Redirects are
+   refused (`redirect: 'error'`), so a local server cannot forward the request to
+   another host.
 2. **Only the Daybook backend talks to it.** The browser never calls Ollama. In this codebase the single call site is `server/src/ai/ollama.js`; there is no client-side path and no API key in the frontend.
-3. **Daybook must run on the same machine or the same private LAN as Ollama.** `127.0.0.1` cannot cross a network boundary. If the app is cloud-hosted, the owner's laptop Ollama is unreachable — by design, since "local only" forbids sending business data to a third party.
-4. **Firewall the port.** Even on a LAN, restrict `11434` to the Daybook host. Do not port-forward it, do not put it behind a path on the public web server.
+3. **Daybook must run on the same machine as Ollama.** `127.0.0.1` cannot cross a network boundary, and a private LAN address is **not** accepted: `validateEndpoint` in `server/src/ai/ollama.js` permits the loopback interface only. An endpoint such as `http://192.168.1.50:11434` is rejected before any connection is attempted, so the assistant reports the model offline and answers from retrieved evidence alone. If the app is hosted, the owner's laptop Ollama is unreachable — by design, since "local only" forbids sending business data to a third party.
+4. **Firewall the port.** Restrict `11434` to the Daybook host on the same machine. Do not port-forward it, do not put it behind a path on the public web server. (Daybook would reject a LAN address anyway; the firewall protects other clients on the machine's network from reaching Ollama directly.)
 5. **No tunnel shortcuts.** Exposing Ollama via ngrok/Cloudflare Tunnel to reach it from a hosted app turns a private model into a public unauthenticated endpoint. This is the most common way local-AI setups get compromised — the pattern is explicitly flagged in the injection screen (`data-exfiltration URL`).
 6. **Recommended production shape:** run Daybook on the owner's own machine or a single-tenant VPS, with Ollama on the same host. If multi-tenant hosting is required, each tenant needs its own inference host — sharing one Ollama across businesses would break the isolation model even though retrieval itself is business-scoped.
 
